@@ -1,18 +1,16 @@
 //+------------------------------------------------------------------+
 //|                                       XAUUSD_Martingale_EA.mq5 |
 //|                                                  Manus AI |
-//|                                        https://github.com/coler07/mql5-format |
 //+------------------------------------------------------------------+
 #property copyright "Manus AI"
 #property link      "https://github.com/coler07/mql5-format"
-#property version   "1.00"
-#property description "Martingale/Grid EA for XAUUSD based on Trend AI principles."
+#property version   "1.01"
+#property description "Martingale EA for XAUUSD - No Visual Grid, Time Limit"
 #property strict
 
 //--- Include necessary libraries
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
-#include <Trade\TerminalInfo.mqh>
 
 //--- Global Objects
 CTrade trade;
@@ -23,11 +21,14 @@ ENUM_TIMEFRAMES TimeFrame = PERIOD_M15;
 //--- Input Parameters
 input group "--- Strategy Settings ---"
 input double InitialLot      = 0.01;      // Initial Lot Size
-input double LotMultiplier   = 2.0;       // Lot Multiplier for Grid
-input int    GridStep        = 500;       // Grid Step in Points (50 pips for XAUUSD)
-input int    TakeProfit      = 500;       // Take Profit for Series in Points (50 pips)
-input int    MaxOrders       = 8;         // Maximum number of orders in a series
+input double LotMultiplier   = 2.0;       // Lot Multiplier after loss
+input int    TakeProfit      = 500;       // Take Profit in Points (50 pips)
+input int    MaxOrders       = 8;         // Maximum consecutive losses
 input int    MagicNumber     = 144401;    // Unique Magic Number
+
+input group "--- Time Management ---"
+input int    MaxHoldingMinutes = 240;     // Max holding time in minutes (4 hours)
+input bool   UseTimeLimit      = true;    // Enable time limit for positions
 
 input group "--- Trend Filter (Simple MA Crossover) ---"
 input int    FastMAPeriod    = 10;        // Fast MA Period
@@ -38,13 +39,17 @@ input ENUM_MA_METHOD MAMethod = MODE_EMA;  // MA Method
 int fast_ma_handle;
 int slow_ma_handle;
 
+//--- Global Variables
+int consecutive_losses = 0;
+datetime last_loss_time = 0;
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    //--- Check if the symbol is XAUUSD
-   if (CurrentSymbol != "XAUUSD")
+   if (CurrentSymbol != "XAUUSD" && CurrentSymbol != "XAUUSDm")
    {
       Print("WARNING: This EA is optimized for XAUUSD. Current symbol is ", CurrentSymbol);
    }
@@ -89,38 +94,23 @@ void OnTick()
    if (current_time == last_time) return;
    last_time = current_time;
    
-   //--- Get current open positions for this symbol and magic number
-   int total_positions = PositionsTotal();
-   int series_count = 0;
-   double last_open_price = 0.0;
-   ENUM_POSITION_TYPE series_type = WRONG_VALUE;
-   
-   for (int i = 0; i < total_positions; i++)
+   //--- Check time limit for open positions
+   if (UseTimeLimit)
    {
-      if (position.SelectByIndex(i))
-      {
-         if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber)
-         {
-            series_count++;
-            last_open_price = position.PriceOpen();
-            series_type = position.PositionType();
-         }
-      }
+      CheckTimeLimit();
    }
    
-   //--- 1. Open Initial Trade
+   //--- Get current open positions for this symbol and magic number
+   int series_count = CountOpenPositions();
+   
+   //--- 1. Open Initial Trade (only if no open positions)
    if (series_count == 0)
    {
       CheckAndOpenInitialTrade();
    }
-   //--- 2. Manage Grid
-   else
-   {
-      ManageGrid(series_count, last_open_price, series_type);
-   }
    
-   //--- 3. Manage Take Profit (Virtual TP for the series)
-   CheckAndCloseSeries(series_type);
+   //--- 2. Manage Take Profit (Virtual TP for all positions)
+   CheckAndCloseSeries();
 }
 
 //+------------------------------------------------------------------+
@@ -147,100 +137,221 @@ void CheckAndOpenInitialTrade()
       return;
    }
    
+   //--- Calculate lot size based on consecutive losses
+   double lot_size = CalculateLotSize();
+   
+   if (lot_size <= 0) 
+   {
+      Print("Cannot calculate lot size or max orders reached");
+      return;
+   }
+   
    //--- Trend Up (Fast MA > Slow MA)
    if (fast_ma[1] > slow_ma[1])
    {
-      trade.Buy(InitialLot, CurrentSymbol, 0, 0, 0, "Initial Buy");
+      if (trade.Buy(lot_size, CurrentSymbol, 0, 0, 0, "Martingale Buy #" + IntegerToString(consecutive_losses + 1)))
+      {
+         Print("Buy opened: Lot ", lot_size, " | Consecutive losses: ", consecutive_losses);
+      }
    }
    //--- Trend Down (Fast MA < Slow MA)
    else if (fast_ma[1] < slow_ma[1])
    {
-      trade.Sell(InitialLot, CurrentSymbol, 0, 0, 0, "Initial Sell");
+      if (trade.Sell(lot_size, CurrentSymbol, 0, 0, 0, "Martingale Sell #" + IntegerToString(consecutive_losses + 1)))
+      {
+         Print("Sell opened: Lot ", lot_size, " | Consecutive losses: ", consecutive_losses);
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Manage Grid Orders                                               |
+//| Calculate Lot Size based on consecutive losses                   |
 //+------------------------------------------------------------------+
-void ManageGrid(int count, double last_price, ENUM_POSITION_TYPE type)
+double CalculateLotSize()
 {
-   if (count >= MaxOrders) return; // Max orders reached
-   
-   ENUM_SYMBOL_INFO_DOUBLE price_type = (type == POSITION_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID;
-   double current_price = SymbolInfoDouble(CurrentSymbol, price_type);
-   double distance = MathAbs(current_price - last_price) / _Point;
-   
-   //--- Check if the distance for a new grid order is reached
-   if (distance >= GridStep)
+   //--- Check if max orders reached
+   if (consecutive_losses >= MaxOrders)
    {
-      //--- Calculate next lot size
-      double next_lot = InitialLot * MathPow(LotMultiplier, count);
-      
-      //--- Normalize lot size to symbol specifications
-      double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
-      double max_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MAX);
-      double step_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_STEP);
-      
-      next_lot = NormalizeDouble(next_lot, 2); // Assuming 2 decimal places for lot size
-      
-      if (next_lot < min_lot) next_lot = min_lot;
-      if (next_lot > max_lot) next_lot = max_lot;
-      
-      //--- Open the next grid order
-      if (type == POSITION_TYPE_BUY)
-      {
-         trade.Buy(next_lot, CurrentSymbol, 0, 0, 0, "Grid Buy #" + IntegerToString(count + 1));
-      }
-      else if (type == POSITION_TYPE_SELL)
-      {
-         trade.Sell(next_lot, CurrentSymbol, 0, 0, 0, "Grid Sell #" + IntegerToString(count + 1));
-      }
+      Print("Max orders (", MaxOrders, ") reached. Waiting for reset...");
+      return 0.0;
    }
+   
+   //--- Calculate lot based on martingale
+   double lot = InitialLot * MathPow(LotMultiplier, consecutive_losses);
+   
+   //--- Normalize lot size to symbol specifications
+   double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MAX);
+   double step_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_STEP);
+   
+   lot = MathFloor(lot / step_lot) * step_lot;
+   lot = NormalizeDouble(lot, 2);
+   
+   if (lot < min_lot) lot = min_lot;
+   if (lot > max_lot) 
+   {
+      Print("Calculated lot (", lot, ") exceeds maximum (", max_lot, ")");
+      lot = max_lot;
+   }
+   
+   return lot;
 }
 
 //+------------------------------------------------------------------+
-//| Check and Close Series (Virtual TP)                              |
+//| Check and Close All Positions if profit target reached           |
 //+------------------------------------------------------------------+
-void CheckAndCloseSeries(ENUM_POSITION_TYPE type)
+void CheckAndCloseSeries()
 {
    double total_profit = 0.0;
+   int position_count = 0;
    
-   //--- Calculate total profit for the series
+   //--- Calculate total profit for all positions
    for (int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if (position.SelectByIndex(i))
       {
-         if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber && position.PositionType() == type)
+         if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber)
          {
             total_profit += position.Profit();
+            position_count++;
          }
       }
    }
    
-   //--- Check if total profit is greater than or equal to the target TP
-   // The TP is in points, so we convert it to currency profit
-   // This is a simplified virtual TP check. A more accurate one would calculate the required price move.
-   // For simplicity, we use a fixed profit target in currency based on the initial trade's TP.
+   if (position_count == 0) return;
    
-   // Calculate the currency value of the TP in points for the initial lot
-   // This is a rough estimate and should be optimized.
-   double point_value = SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_VALUE) / SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_SIZE);
-   double target_currency_profit = (double)TakeProfit * point_value * InitialLot;
+   //--- Calculate target profit
+   // Simple approach: close if total profit >= $1.00 per initial lot
+   double target_profit = 1.0 * (consecutive_losses + 1);
    
-   // Since the grid increases the lot size, the actual profit target should be higher.
-   // A simpler and more robust approach for a grid is to close when the total profit is positive and exceeds a small buffer.
-   // Let's use a minimum profit of $1.00 as a simple, safe target for the entire series.
-   
-   if (total_profit >= 1.0) // Close if total profit is $1.00 or more
+   if (total_profit >= target_profit)
    {
-      for (int i = PositionsTotal() - 1; i >= 0; i--)
+      //--- Close all positions
+      CloseAllPositions();
+      
+      //--- Reset consecutive losses (profit achieved)
+      Print("Target profit reached: $", DoubleToString(total_profit, 2), " | Resetting consecutive losses");
+      consecutive_losses = 0;
+      last_loss_time = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close All Positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (position.SelectByIndex(i))
       {
-         if (position.SelectByIndex(i))
+         if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber)
          {
-            if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber && position.PositionType() == type)
+            trade.PositionClose(position.Ticket());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count Open Positions                                             |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+{
+   int count = 0;
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (position.SelectByIndex(i))
+      {
+         if (position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber)
+            count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check Time Limit for positions                                   |
+//+------------------------------------------------------------------+
+void CheckTimeLimit()
+{
+   datetime current_time = TimeCurrent();
+   
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if (!position.SelectByIndex(i)) continue;
+      if (position.Symbol() != CurrentSymbol || position.Magic() != MagicNumber) continue;
+      
+      datetime open_time = (datetime)position.Time();
+      int holding_minutes = (int)((current_time - open_time) / 60);
+      
+      //--- If holding time exceeds limit
+      if (holding_minutes >= MaxHoldingMinutes)
+      {
+         double profit = position.Profit();
+         
+         Print("Time limit exceeded (", holding_minutes, " min). Closing position. P/L: $", DoubleToString(profit, 2));
+         
+         trade.PositionClose(position.Ticket());
+         
+         //--- Update consecutive losses
+         if (profit < 0)
+         {
+            consecutive_losses++;
+            last_loss_time = current_time;
+            
+            if (consecutive_losses >= MaxOrders)
             {
-               trade.PositionClose(position.Ticket());
+               Print("WARNING: Max consecutive losses reached (", consecutive_losses, "/", MaxOrders, ")");
             }
+         }
+         else
+         {
+            //--- Profit or break-even, reset counter
+            consecutive_losses = 0;
+            last_loss_time = 0;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OnTrade - Track closed positions                                 |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   //--- Check if position was closed
+   if (HistorySelect(TimeCurrent() - 60, TimeCurrent()))
+   {
+      int total = HistoryDealsTotal();
+      
+      for (int i = total - 1; i >= 0; i--)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if (ticket <= 0) continue;
+         
+         if (HistoryDealGetString(ticket, DEAL_SYMBOL) == CurrentSymbol &&
+             HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber &&
+             HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+         {
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+            
+            //--- If closed with loss (and not closed by time limit already processed)
+            if (profit < 0 && CountOpenPositions() == 0)
+            {
+               consecutive_losses++;
+               last_loss_time = TimeCurrent();
+               Print("Position closed with loss. Consecutive losses: ", consecutive_losses);
+            }
+            else if (profit >= 0 && CountOpenPositions() == 0)
+            {
+               //--- Profit achieved, reset
+               consecutive_losses = 0;
+               last_loss_time = 0;
+               Print("Position closed with profit. Reset consecutive losses.");
+            }
+            
+            break; // Process only the most recent deal
          }
       }
    }
