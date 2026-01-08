@@ -1,10 +1,11 @@
+
 //+------------------------------------------------------------------+
-//|                                  XAUUSD Pullback Trader EA       |
-//|                                  Trend Continuation Strategy     |
+//|                                  XAUUSD Arrow Trader EA          |
+//|                  Green Arrow Buy / Red Arrow Sell Logic          |
 //+------------------------------------------------------------------+
 #property copyright "Manus AI"
-#property version   "4.00"
-#property description "Pullback Trading - Entry on trend continuation"
+#property version   "5.00" 
+#property description "Trading berdasarkan Simulasi Panah (Rejection di Zona Support/Resistance)"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -19,43 +20,47 @@ ENUM_TIMEFRAMES TrendTF = PERIOD_H1;
 
 //--- Input Parameters
 input group "=== Risk Management ==="
-input bool   UseFixedLot     = true;      // Use Fixed Lot (true) or Risk % (false)
-input double FixedLotSize    = 0.01;      // Fixed Lot Size (jika UseFixedLot = true)
-input double RiskPercent     = 3.0;       // Risk per trade % (jika UseFixedLot = false)
-input int    StopLossPips    = 200;       // Stop Loss in pips (wide like Beatrix)
-input int    TakeProfitPips  = 0;         // Take Profit (0 = no fixed TP, use trailing only)
-input int    TrailingStart   = 20;        // Trailing start pips (AGGRESSIVE!)
-input int    TrailingStop    = 15;        // Trailing stop pips (TIGHT!)
-input int    BreakEvenPips   = 30;        // Break even after X pips
+input bool   UseFixedLot     = true;      
+input double FixedLotSize    = 0.01;      
+input double RiskPercent     = 3.0;       
+input int    StopLossPips    = 200;       
+input int    TakeProfitPips  = 400;       
+input int    TrailingStart   = 20;        
+input int    TrailingStop    = 15;        
+input int    BreakEvenPips   = 30;        
 
-input group "=== Pullback Settings ==="
-input int    EMA_Fast        = 20;        // Fast EMA (M15)
-input int    EMA_Slow        = 50;        // Slow EMA (M15)
-input int    EMA_Trend       = 100;       // Trend EMA (H1)
-input double PullbackZone    = 40;        // Max distance from EMA (pips)
-input int    MinBarsSince    = 2;         // Min bars between entries (allow pyramiding)
+input group "=== Trend & Arrow Settings ==="
+input int    EMA_Trend       = 100;       // EMA H1 untuk penentu tren besar
+input int    MinBarsSince    = 2;          // Jarak minimal antar trade (dalam bar)
+
+// --- Parameter Orderblock (Zona Support/Resistance) ---
+input group "=== Orderblock (Zona Panah) Settings ==="
+input int    OB_Lookback     = 10;        // Jumlah candle ke belakang untuk mencari zona terkuat
+input double OB_PullbackThreshold = 0.5;  // Seberapa dekat harga harus menyentuh zona (dalam %)
 
 input group "=== Pyramiding (Multiple Entries) ==="
-input bool   UsePyramiding   = true;      // Enable pyramiding (add positions in trend)
-input int    MaxPositions    = 3;         // Max positions at once (like Beatrix)
-input int    PyramidStep     = 30;        // Add position every X pips profit
+input bool   UsePyramiding   = true;      
+input int    MaxPositions    = 3;         
+input int    PyramidStep     = 30;        
 
 input group "=== Trade Management ==="
-input int    MagicNumber     = 144406;    // Magic Number
-input int    MaxDailyTrades  = 10;        // Max trades per day
-input double MaxDailyLossPct = 5.0;       // Max daily loss %
+input int    MagicNumber     = 144406;    
+input int    MaxDailyTrades  = 10;        
+double MaxDailyLossPct = 5.0;       
 
-input group "=== paramater summry ==="
+input group "=== Partial Close Settings ==="
 input bool  UsePartialClose = true;
 input double PartialClosePercent = 50.0;
 input int    PartialCloseAtPips  = 60;
 
-
-
 //--- Global Handles
-int fast_ema_handle;
-int slow_ema_handle;
 int h1_ema_handle;
+
+// --- Variabel global untuk menyimpan Zona Support/Resistance ---
+double last_buy_ob_high = 0;
+double last_buy_ob_low = 0;
+double last_sell_ob_high = 0;
+double last_sell_ob_low = 0;
 
 //--- Global Variables
 datetime last_trade_time = 0;
@@ -83,19 +88,16 @@ int OnInit()
    trade.SetDeviationInPoints(50);
    
    //--- Create indicators
-   fast_ema_handle = iMA(CurrentSymbol, EntryTF, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
-   slow_ema_handle = iMA(CurrentSymbol, EntryTF, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
    h1_ema_handle = iMA(CurrentSymbol, TrendTF, EMA_Trend, 0, MODE_EMA, PRICE_CLOSE);
    
-   if (fast_ema_handle == INVALID_HANDLE || slow_ema_handle == INVALID_HANDLE || 
-       h1_ema_handle == INVALID_HANDLE)
+   if (h1_ema_handle == INVALID_HANDLE)
    {
       Print("Error creating indicators");
       return(INIT_FAILED);
    }
    
-   Print("=== Pullback Trader Initialized ===");
-   Print("Strategy: Pullback to EMA in trend | TF: M15 | Trend: H1");
+   Print("=== Arrow Trader Initialized ===");
+   Print("Logic: Green Arrow (Buy) / Red Arrow (Sell)");
    
    //--- Create dashboard
    CreateDashboard();
@@ -108,11 +110,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if (fast_ema_handle != INVALID_HANDLE) IndicatorRelease(fast_ema_handle);
-   if (slow_ema_handle != INVALID_HANDLE) IndicatorRelease(slow_ema_handle);
    if (h1_ema_handle != INVALID_HANDLE) IndicatorRelease(h1_ema_handle);
-   
-   //--- Delete dashboard
    DeleteDashboard();
 }
 
@@ -127,6 +125,9 @@ void OnTick()
    if (current_bar == last_bar) return;
    last_bar = current_bar;
    
+   //--- Update status zona (Support/Resistance) di setiap bar baru
+   UpdateOrderblocks();
+   
    //--- Reset daily stats
    CheckDailyReset();
    
@@ -136,13 +137,12 @@ void OnTick()
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if (daily_profit <= -(balance * MaxDailyLossPct / 100.0)) return;
    
-   //--- Manage existing positions
+   //--- Manage existing positions (SL, TP, Trailing)
    ManagePositions();
    
    //--- Check if can open new trade
    int open_positions = CountOpenPositions();
    
-   // Allow pyramiding if enabled
    if (open_positions >= MaxPositions) return;
    
    // Check for pyramiding opportunity
@@ -151,15 +151,15 @@ void OnTick()
       CheckPyramidingOpportunity();
    }
    
-   // Check for new initial entry
+   // Check for new initial entry (LOGIKA PANAH DISINI)
    if (open_positions == 0)
    {
       //--- Check minimum bars between entries
       int bars_since = (int)((TimeCurrent() - last_trade_time) / PeriodSeconds(EntryTF));
       if (bars_since < MinBarsSince && last_trade_time > 0) return;
       
-      //--- Look for pullback signals
-      CheckPullbackSignals();
+      //--- Cek sinyal Panah Hijau / Merah
+      CheckArrowSignals();
    }
    
    //--- Update display
@@ -167,100 +167,166 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Check for Pullback Signals                                       |
+//| Update Zona Support (Green) & Resistance (Red)                   |
 //+------------------------------------------------------------------+
-void CheckPullbackSignals()
+void UpdateOrderblocks()
 {
-   //--- Get H1 Trend EMA
+   double current_bid = SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
+   double current_ask = SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+
+   // --- 1. CEK VALIDITAS ZONA ---
+   // Jika harga menembus zona, maka zona dianggap tidak valid (broken)
+   if (last_buy_ob_high > 0 && current_bid > last_buy_ob_high)
+   {
+      last_buy_ob_high = 0;
+      last_buy_ob_low = 0;
+   }
+   if (last_sell_ob_low > 0 && current_ask < last_sell_ob_low)
+   {
+      last_sell_ob_high = 0;
+      last_sell_ob_low = 0;
+   }
+
+   // --- 2. CARI ZONA BARU JIKA TIDAK ADA YANG VALID ---
+   if (last_buy_ob_high == 0 || last_sell_ob_low == 0)
+   {
+      double high[], low[], close[], open[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      ArraySetAsSeries(close, true);
+      ArraySetAsSeries(open, true);
+      
+      if (CopyHigh(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, high) < OB_Lookback + 2) return;
+      if (CopyLow(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, low) < OB_Lookback + 2) return;
+      if (CopyClose(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, close) < OB_Lookback + 2) return;
+      if (CopyOpen(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, open) < OB_Lookback + 2) return;
+
+      // Cari candle bullish terkuat untuk Zona Support (Buy OB)
+      if (last_buy_ob_high == 0)
+      {
+         double max_range = 0;
+         int strongest_candle_index = -1;
+         for (int i = 1; i <= OB_Lookback; i++)
+         {
+            if (close[i] > open[i]) // Candle bullish
+            {
+               double candle_range = high[i] - low[i];
+               if (candle_range > max_range)
+               {
+                  max_range = candle_range;
+                  strongest_candle_index = i;
+               }
+            }
+         }
+         if (strongest_candle_index != -1)
+         {
+            last_buy_ob_high = high[strongest_candle_index];
+            last_buy_ob_low = low[strongest_candle_index];
+         }
+      }
+
+      // Cari candle bearish terkuat untuk Zona Resistance (Sell OB)
+      if (last_sell_ob_low == 0)
+      {
+         double max_range = 0;
+         int strongest_candle_index = -1;
+         for (int i = 1; i <= OB_Lookback; i++)
+         {
+            if (close[i] < open[i]) // Candle bearish
+            {
+               double candle_range = high[i] - low[i];
+               if (candle_range > max_range)
+               {
+                  max_range = candle_range;
+                  strongest_candle_index = i;
+               }
+            }
+         }
+         if (strongest_candle_index != -1)
+         {
+            last_sell_ob_high = high[strongest_candle_index];
+            last_sell_ob_low = low[strongest_candle_index];
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| LOGIKA UTAMA: Cek Panah Hijau (Buy) & Merah (Sell)               |
+//+------------------------------------------------------------------+
+void CheckArrowSignals()
+{
+   //--- Get H1 Trend EMA (Filter Trend)
    double h1_ema[];
    ArraySetAsSeries(h1_ema, true);
-   if (CopyBuffer(h1_ema_handle, 0, 0, 3, h1_ema) < 3) return;
-   
+   if (CopyBuffer(h1_ema_handle, 0, 0, 2, h1_ema) < 2) return;
    double h1_close = iClose(CurrentSymbol, TrendTF, 1);
-   
-   // Determine H1 trend
    bool h1_bullish = (h1_close > h1_ema[1]);
    bool h1_bearish = (h1_close < h1_ema[1]);
    
-   //--- Get M15 EMAs
-   double fast_ema[], slow_ema[];
-   ArraySetAsSeries(fast_ema, true);
-   ArraySetAsSeries(slow_ema, true);
-   if (CopyBuffer(fast_ema_handle, 0, 0, 5, fast_ema) < 5) return;
-   if (CopyBuffer(slow_ema_handle, 0, 0, 5, slow_ema) < 5) return;
-   
-   //--- Get price data
-   double high[], low[], close[], open[];
+   //--- Data Candle M15 saat ini (index 1 karena bar baru sudah terbentuk di OnTick start)
+   double open[], close[], high[], low[];
+   ArraySetAsSeries(open, true);
+   ArraySetAsSeries(close, true);
    ArraySetAsSeries(high, true);
    ArraySetAsSeries(low, true);
-   ArraySetAsSeries(close, true);
-   ArraySetAsSeries(open, true);
-   
-   if (CopyHigh(CurrentSymbol, EntryTF, 0, 5, high) < 5) return;
-   if (CopyLow(CurrentSymbol, EntryTF, 0, 5, low) < 5) return;
-   if (CopyClose(CurrentSymbol, EntryTF, 0, 5, close) < 5) return;
-   if (CopyOpen(CurrentSymbol, EntryTF, 0, 5, open) < 5) return;
-   
-   double point = SymbolInfoDouble(CurrentSymbol, SYMBOL_POINT);
-   
-   //--- BUY Pullback Setup
-   if (h1_bullish && fast_ema[1] > slow_ema[1])
+   if (CopyOpen(CurrentSymbol, EntryTF, 0, 2, open) < 2) return;
+   if (CopyClose(CurrentSymbol, EntryTF, 0, 2, close) < 2) return;
+   if (CopyHigh(CurrentSymbol, EntryTF, 0, 2, high) < 2) return;
+   if (CopyLow(CurrentSymbol, EntryTF, 0, 2, low) < 2) return;
+
+   //--- Harga Saat Ini
+   double current_bid = SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
+   double current_ask = SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+
+   // ==========================================
+   // 1. LOGIKA BUY (GREEN ARROW)
+   // ==========================================
+   // Syarat: Tren Naik H1 + Harga di Zona Support + Candle Bullish (Rejection)
+   if (h1_bullish && last_buy_ob_low > 0)
    {
-      // Check if price pulled back to Fast EMA
-      double distance_to_ema = MathAbs(close[1] - fast_ema[1]) / (point * 10);
+      // Cek apakah harga menyentuh/masuk zona support
+      double ob_range = last_buy_ob_high - last_buy_ob_low;
+      double threshold = ob_range * OB_PullbackThreshold;
       
-      if (distance_to_ema <= PullbackZone)
+      // Apakah low candle menyentuh area support?
+      bool touched_zone = (low[1] <= last_buy_ob_high + threshold && low[1] >= last_buy_ob_low - threshold);
+      
+      // Apakah candle berakhir hijau (Buy rejection)?
+      bool green_candle = (close[1] > open[1]); 
+      
+      if (touched_zone && green_candle)
       {
-         // Check for bullish rejection
-         bool bullish_candle = (close[1] > open[1]);
-         bool bouncing_up = (close[1] > close[2]);
-         bool lower_wick = (MathMin(open[1], close[1]) - low[1]) > (close[1] - open[1]);
-         
-         if ((bullish_candle || bouncing_up) && close[1] > fast_ema[1])
-         {
-            Print(">>> BUY Pullback Signal <<<");
-            Print("H1 Trend: BULLISH | Distance to EMA: ", DoubleToString(distance_to_ema, 1), " pips");
-            Print("Price: ", close[1], " | Fast EMA: ", fast_ema[1]);
-            OpenTrade(ORDER_TYPE_BUY);
-            return;
-         }
+         Print(">>> GREEN ARROW DETECTED (Buy Signal) <<<");
+         Print("Price rejected Support Zone: [", last_buy_ob_low, " - ", last_buy_ob_high, "]");
+         OpenTrade(ORDER_TYPE_BUY);
+         return;
       }
    }
    
-   //--- SELL Pullback Setup
-   if (h1_bearish && fast_ema[1] < slow_ema[1])
+   // ==========================================
+   // 2. LOGIKA SELL (RED ARROW)
+   // ==========================================
+   // Syarat: Tren Turun H1 + Harga di Zona Resistance + Candle Bearish (Rejection)
+   if (h1_bearish && last_sell_ob_high > 0)
    {
-      // Check if price pulled back to Fast EMA
-      double distance_to_ema = MathAbs(close[1] - fast_ema[1]) / (point * 10);
+      // Cek apakah harga menyentuh/masuk zona resistance
+      double ob_range = last_sell_ob_high - last_sell_ob_low;
+      double threshold = ob_range * OB_PullbackThreshold;
       
-      if (distance_to_ema <= PullbackZone)
+      // Apakah high candle menyentuh area resistance?
+      bool touched_zone = (high[1] >= last_sell_ob_low - threshold && high[1] <= last_sell_ob_high + threshold);
+      
+      // Apakah candle berakhir merah (Sell rejection)?
+      bool red_candle = (close[1] < open[1]);
+      
+      if (touched_zone && red_candle)
       {
-         // Check for bearish rejection
-         bool bearish_candle = (close[1] < open[1]);
-         bool bouncing_down = (close[1] < close[2]);
-         bool upper_wick = (high[1] - MathMax(open[1], close[1])) > (open[1] - close[1]);
-         
-         if ((bearish_candle || bouncing_down) && close[1] < fast_ema[1])
-         {
-            Print(">>> SELL Pullback Signal <<<");
-            Print("H1 Trend: BEARISH | Distance to EMA: ", DoubleToString(distance_to_ema, 1), " pips");
-            Print("Price: ", close[1], " | Fast EMA: ", fast_ema[1]);
-            OpenTrade(ORDER_TYPE_SELL);
-            return;
-         }
+         Print(">>> RED ARROW DETECTED (Sell Signal) <<<");
+         Print("Price rejected Resistance Zone: [", last_sell_ob_low, " - ", last_sell_ob_high, "]");
+         OpenTrade(ORDER_TYPE_SELL);
+         return;
       }
-   }
-   
-   //--- Debug output every 20 bars
-   static int debug_counter = 0;
-   debug_counter++;
-   if (debug_counter >= 20)
-   {
-      debug_counter = 0;
-      Print("=== Status ===");
-      Print("H1 Trend: ", (h1_bullish ? "BULLISH" : "BEARISH"));
-      Print("M15 EMA: Fast=", DoubleToString(fast_ema[1], 2), " Slow=", DoubleToString(slow_ema[1], 2));
-      Print("Close: ", close[1], " | Distance: ", DoubleToString(MathAbs(close[1] - fast_ema[1])/(point*10), 1), " pips");
    }
 }
 
@@ -271,139 +337,70 @@ void OpenTrade(ENUM_ORDER_TYPE order_type)
 {
    double point = SymbolInfoDouble(CurrentSymbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS);
-   
-   // XAUUSD: 1 pip = 10 points (karena 3 digit)
    double pip_value = (digits == 3 || digits == 5) ? 10 : 1;
    
-   //--- Calculate lot size
    double lot_size;
-   
-   if (UseFixedLot)
-   {
-      // Gunakan fixed lot
-      lot_size = FixedLotSize;
-      Print("Using Fixed Lot: ", lot_size);
-   }
+   if (UseFixedLot) lot_size = FixedLotSize;
    else
    {
-      // Calculate lot based on risk %
       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
       double risk_money = balance * (RiskPercent / 100.0);
       double tick_value = SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_VALUE);
       double tick_size = SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_SIZE);
-      
       double sl_distance = StopLossPips * pip_value * point;
       lot_size = risk_money / ((StopLossPips * pip_value) * tick_value / tick_size);
-      Print("Calculated Lot from Risk ", RiskPercent, "%: ", lot_size);
    }
    
-   //--- Normalize lot
    double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
    double max_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MAX);
    double step_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_STEP);
-   
    lot_size = MathFloor(lot_size / step_lot) * step_lot;
    lot_size = NormalizeDouble(lot_size, 2);
-   
    if (lot_size < min_lot) lot_size = min_lot;
    if (lot_size > max_lot) lot_size = max_lot;
    
-   //--- Get entry price
    double price = (order_type == ORDER_TYPE_BUY) ? 
                   SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK) : 
                   SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
    
-   //--- Calculate SL and TP dengan benar
    double sl, tp;
    if (order_type == ORDER_TYPE_BUY)
    {
-      sl = price - (StopLossPips * pip_value * point);      // Wide SL
-      
-      // TP: if 0, no fixed TP (use trailing only)
-      if (TakeProfitPips > 0)
-         tp = price + (TakeProfitPips * pip_value * point);
-      else
-         tp = 0; // No fixed TP, rely on trailing
+      sl = price - (StopLossPips * pip_value * point);
+      if (TakeProfitPips > 0) tp = price + (TakeProfitPips * pip_value * point); else tp = 0;
    }
    else
    {
       sl = price + (StopLossPips * pip_value * point);
-      
-      if (TakeProfitPips > 0)
-         tp = price - (TakeProfitPips * pip_value * point);
-      else
-         tp = 0; // No fixed TP, rely on trailing
+      if (TakeProfitPips > 0) tp = price - (TakeProfitPips * pip_value * point); else tp = 0;
    }
    
    sl = NormalizeDouble(sl, digits);
    if (tp > 0) tp = NormalizeDouble(tp, digits);
    
-   //--- Validasi SL/TP distance
-   double sl_distance_check = MathAbs(price - sl);
-   double tp_distance_check = (tp > 0) ? MathAbs(price - tp) : 0;
+   string comment = (order_type == ORDER_TYPE_BUY) ? "Arrow Signal BUY" : "Arrow Signal SELL";
    
-   Print("=== Order Details ===");
-   Print("Entry Price: ", price);
-   Print("Stop Loss: ", sl, " (Distance: ", DoubleToString(sl_distance_check, digits), ")");
-   if (tp > 0)
-      Print("Take Profit: ", tp, " (Distance: ", DoubleToString(tp_distance_check, digits), ")");
-   else
-      Print("Take Profit: TRAILING ONLY (no fixed TP)");
-   Print("Lot Size: ", lot_size);
+   if (order_type == ORDER_TYPE_BUY) trade.Buy(lot_size, CurrentSymbol, 0, sl, tp, comment);
+   else trade.Sell(lot_size, CurrentSymbol, 0, sl, tp, comment);
    
-   // Check minimum distance (broker requirement)
-   int min_stop_level = (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if (min_stop_level > 0)
-   {
-      double min_distance = min_stop_level * point;
-      if (sl_distance_check < min_distance)
-      {
-         Print("ERROR: SL too close to price. Min distance: ", min_distance);
-         return;
-      }
-      if (tp > 0 && tp_distance_check < min_distance)
-      {
-         Print("ERROR: TP too close to price. Min distance: ", min_distance);
-         return;
-      }
-   }
-   
-   //--- Open trade
-   bool result;
-   string comment = (order_type == ORDER_TYPE_BUY) ? "Pullback BUY" : "Pullback SELL";
-   
-   if (order_type == ORDER_TYPE_BUY)
-      result = trade.Buy(lot_size, CurrentSymbol, 0, sl, tp, comment);
-   else
-      result = trade.Sell(lot_size, CurrentSymbol, 0, sl, tp, comment);
-   
-   if (result)
+   if (trade.ResultRetcode() == TRADE_RETCODE_DONE)
    {
       last_trade_time = TimeCurrent();
       daily_trades++;
       Print("✓ Trade Opened: ", comment);
-      Print("  Entry: ", price, " | SL: ", sl);
-      if (tp > 0)
-         Print("  TP: ", tp, " (", DoubleToString(tp_distance_check/(pip_value*point), 1), " pips)");
-      else
-         Print("  TP: Trailing Only");
-      Print("  SL Distance: ", DoubleToString(sl_distance_check/(pip_value*point), 1), " pips");
-      Print("  Trailing will start at ", TrailingStart, " pips profit");
    }
    else
    {
       Print("✗ Trade Failed: ", trade.ResultRetcodeDescription());
-      Print("  Error Code: ", trade.ResultRetcode());
    }
 }
 
 //+------------------------------------------------------------------+
-//| Check Pyramiding Opportunity (Add Position in Trend)             |
+//| Check Pyramiding Opportunity                                     |
 //+------------------------------------------------------------------+
 void CheckPyramidingOpportunity()
 {
    if (!UsePyramiding) return;
-   
    int open_positions = CountOpenPositions();
    if (open_positions >= MaxPositions) return;
    
@@ -411,9 +408,7 @@ void CheckPyramidingOpportunity()
    int digits = (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS);
    double pip_value = (digits == 3 || digits == 5) ? 10 : 1;
    
-   //--- Get first position info
    ENUM_POSITION_TYPE first_type = WRONG_VALUE;
-   double first_open = 0;
    double total_profit_pips = 0;
    
    for (int i = 0; i < PositionsTotal(); i++)
@@ -421,13 +416,8 @@ void CheckPyramidingOpportunity()
       if (!position.SelectByIndex(i)) continue;
       if (position.Symbol() != CurrentSymbol || position.Magic() != MagicNumber) continue;
       
-      if (first_type == WRONG_VALUE)
-      {
-         first_type = position.PositionType();
-         first_open = position.PriceOpen();
-      }
+      if (first_type == WRONG_VALUE) first_type = position.PositionType();
       
-      // Calculate average profit
       double current_price = (position.PositionType() == POSITION_TYPE_BUY) ?
                             SymbolInfoDouble(CurrentSymbol, SYMBOL_BID) :
                             SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
@@ -442,26 +432,19 @@ void CheckPyramidingOpportunity()
    
    double avg_profit_pips = total_profit_pips / open_positions;
    
-   //--- Check if profit enough to add position
    if (avg_profit_pips >= PyramidStep)
    {
-      // Check bars since last trade (avoid too frequent pyramiding)
       int bars_since = (int)((TimeCurrent() - last_trade_time) / PeriodSeconds(EntryTF));
       if (bars_since < MinBarsSince) return;
       
       Print(">>> Pyramiding Opportunity <<<");
-      Print("Current positions: ", open_positions, " | Avg profit: ", DoubleToString(avg_profit_pips, 1), " pips");
-      
-      // Add position in same direction
-      if (first_type == POSITION_TYPE_BUY)
-         OpenTrade(ORDER_TYPE_BUY);
-      else
-         OpenTrade(ORDER_TYPE_SELL);
+      if (first_type == POSITION_TYPE_BUY) OpenTrade(ORDER_TYPE_BUY);
+      else OpenTrade(ORDER_TYPE_SELL);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Manage Positions (Trailing + Break Even)                         |
+//| Manage Positions                                                 |
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
@@ -477,6 +460,40 @@ void ManagePositions()
       double open_price = position.PriceOpen();
       double current_sl = position.StopLoss();
       ulong ticket = position.Ticket();
+      double current_volume = position.Volume(); 
+      
+      if (UsePartialClose)
+      {
+         double current_price = (position.PositionType() == POSITION_TYPE_BUY) ? 
+                               SymbolInfoDouble(CurrentSymbol, SYMBOL_BID) :
+                               SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+         
+         double profit_distance = (position.PositionType() == POSITION_TYPE_BUY) ?
+                                 (current_price - open_price) :
+                                 (open_price - current_price);
+         
+         double profit_pips = profit_distance / (pip_value * point);
+         
+         double initial_lot = UseFixedLot ? FixedLotSize : 0.01; 
+         if (profit_pips >= PartialCloseAtPips && MathAbs(current_volume - initial_lot) < 0.001)
+         {
+            double volume_to_close = NormalizeDouble(current_volume * (PartialClosePercent / 100.0), 2);
+            double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
+            if (volume_to_close >= min_lot)
+            {
+               if (trade.PositionClosePartial(ticket, volume_to_close))
+               {
+                  if(position.SelectByIndex(i))
+                  {
+                     double new_sl = open_price;
+                     new_sl = NormalizeDouble(new_sl, digits);
+                     trade.PositionModify(ticket, new_sl, position.TakeProfit());
+                  }
+               }
+               continue;
+            }
+         }
+      }
       
       if (position.PositionType() == POSITION_TYPE_BUY)
       {
@@ -484,25 +501,18 @@ void ManagePositions()
          double profit_distance = bid - open_price;
          double profit_pips = profit_distance / (pip_value * point);
          
-         //--- Move to Break Even
          if (profit_pips >= BreakEvenPips && current_sl < open_price)
          {
-            double new_sl = open_price + (pip_value * point); // BE + 1 pip
+            double new_sl = open_price + (pip_value * point); 
             new_sl = NormalizeDouble(new_sl, digits);
             trade.PositionModify(ticket, new_sl, position.TakeProfit());
-            Print("Break Even: SL moved to ", new_sl);
          }
-         //--- Trailing Stop
-         else if (profit_pips >= TrailingStart)
+         
+         if (profit_pips >= TrailingStart) 
          {
             double new_sl = bid - (TrailingStop * pip_value * point);
             new_sl = NormalizeDouble(new_sl, digits);
-            
-            if (new_sl > current_sl && new_sl < bid)
-            {
-               trade.PositionModify(ticket, new_sl, position.TakeProfit());
-               Print("Trailing: SL moved to ", new_sl, " (", DoubleToString(profit_pips, 1), " pips profit)");
-            }
+            if (new_sl > current_sl && new_sl < bid) trade.PositionModify(ticket, new_sl, position.TakeProfit());
          }
       }
       else // SELL
@@ -511,25 +521,18 @@ void ManagePositions()
          double profit_distance = open_price - ask;
          double profit_pips = profit_distance / (pip_value * point);
          
-         //--- Move to Break Even
          if (profit_pips >= BreakEvenPips && (current_sl == 0 || current_sl > open_price))
          {
-            double new_sl = open_price - (pip_value * point); // BE + 1 pip
+            double new_sl = open_price - (pip_value * point); 
             new_sl = NormalizeDouble(new_sl, digits);
             trade.PositionModify(ticket, new_sl, position.TakeProfit());
-            Print("Break Even: SL moved to ", new_sl);
          }
-         //--- Trailing Stop
-         else if (profit_pips >= TrailingStart)
+         
+         if (profit_pips >= TrailingStart) 
          {
             double new_sl = ask + (TrailingStop * pip_value * point);
             new_sl = NormalizeDouble(new_sl, digits);
-            
-            if ((current_sl == 0 || new_sl < current_sl) && new_sl > ask)
-            {
-               trade.PositionModify(ticket, new_sl, position.TakeProfit());
-               Print("Trailing: SL moved to ", new_sl, " (", DoubleToString(profit_pips, 1), " pips profit)");
-            }
+            if ((current_sl == 0 || new_sl < current_sl) && new_sl > ask) trade.PositionModify(ticket, new_sl, position.TakeProfit());
          }
       }
    }
@@ -581,7 +584,6 @@ void CheckDailyReset()
 //+------------------------------------------------------------------+
 void CreateDashboard()
 {
-   //--- Background Panel
    string bg_name = dashboard_name + "_BG";
    if (ObjectCreate(0, bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0))
    {
@@ -598,33 +600,21 @@ void CreateDashboard()
       ObjectSetInteger(0, bg_name, OBJPROP_SELECTABLE, false);
    }
    
-   //--- Title
-   CreateLabel("Title", "PULLBACK TRADER BY ADAM", 15, clrDodgerBlue, 10, 10);
+   CreateLabel("Title", "ARROW TRADER BY ADAM v5.00", 15, clrDodgerBlue, 10, 10);
+   CreateLabel("Strategy", "Logic: Green Arrow Buy / Red Arrow Sell", 9, clrWhite, 10, 35);
    
-   //--- Strategy Info
-   CreateLabel("Strategy", "Strategy: EMA Pullback + Pyramiding", 9, clrWhite, 10, 35);
-   
-   //--- Account Info
    CreateLabel("Balance_Label", "Balance:", 9, clrGray, 10, 60);
    CreateLabel("Balance_Value", "$0.00", 10, clrLime, 120, 60);
-   
    CreateLabel("Equity_Label", "Equity:", 9, clrGray, 10, 80);
    CreateLabel("Equity_Value", "$0.00", 10, clrLime, 120, 80);
-   
    CreateLabel("Profit_Label", "Total Profit:", 9, clrGray, 10, 100);
    CreateLabel("Profit_Value", "$0.00", 10, clrYellow, 120, 100);
-   
-   //--- Trade Info
    CreateLabel("Positions_Label", "Open Positions:", 9, clrGray, 10, 125);
    CreateLabel("Positions_Value", "0/3", 10, clrAqua, 140, 125);
-   
    CreateLabel("DailyTrades_Label", "Daily Trades:", 9, clrGray, 10, 145);
    CreateLabel("DailyTrades_Value", "0/10", 10, clrAqua, 140, 145);
-   
    CreateLabel("DailyPL_Label", "Daily P/L:", 9, clrGray, 10, 165);
    CreateLabel("DailyPL_Value", "$0.00", 10, clrYellow, 140, 165);
-   
-   //--- Risk Info
    CreateLabel("Risk_Label", "Risk per Trade:", 9, clrGray, 10, 190);
    CreateLabel("Risk_Value", "Lot: 0.01", 10, clrOrange, 140, 190);
    
@@ -674,29 +664,23 @@ void UpdateDashboard()
       }
    }
    
-   //--- Update values
    ObjectSetString(0, dashboard_name + "_Balance_Value", OBJPROP_TEXT, "$" + DoubleToString(balance, 2));
    ObjectSetString(0, dashboard_name + "_Equity_Value", OBJPROP_TEXT, "$" + DoubleToString(equity, 2));
    
-   // Profit color
    color profit_color = (total_profit >= 0) ? clrLime : clrRed;
    ObjectSetString(0, dashboard_name + "_Profit_Value", OBJPROP_TEXT, "$" + DoubleToString(total_profit, 2));
    ObjectSetInteger(0, dashboard_name + "_Profit_Value", OBJPROP_COLOR, profit_color);
    
-   // Positions
    ObjectSetString(0, dashboard_name + "_Positions_Value", OBJPROP_TEXT, 
                    IntegerToString(open_positions) + "/" + IntegerToString(MaxPositions));
    
-   // Daily trades
    ObjectSetString(0, dashboard_name + "_DailyTrades_Value", OBJPROP_TEXT, 
                    IntegerToString(daily_trades) + "/" + IntegerToString(MaxDailyTrades));
    
-   // Daily P/L
    color daily_color = (daily_profit >= 0) ? clrLime : clrRed;
    ObjectSetString(0, dashboard_name + "_DailyPL_Value", OBJPROP_TEXT, "$" + DoubleToString(daily_profit, 2));
    ObjectSetInteger(0, dashboard_name + "_DailyPL_Value", OBJPROP_COLOR, daily_color);
    
-   // Risk
    string risk_text = UseFixedLot ? ("Lot: " + DoubleToString(FixedLotSize, 2)) : (DoubleToString(RiskPercent, 1) + "%");
    ObjectSetString(0, dashboard_name + "_Risk_Value", OBJPROP_TEXT, risk_text);
    
