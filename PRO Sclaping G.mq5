@@ -1,11 +1,10 @@
-
 //+------------------------------------------------------------------+
 //|                                  XAUUSD Arrow Trader EA          |
 //|                  Green Arrow Buy / Red Arrow Sell Logic          |
 //+------------------------------------------------------------------+
 #property copyright "Manus AI"
-#property version   "5.00" 
-#property description "Trading berdasarkan Simulasi Panah (Rejection di Zona Support/Resistance)"
+#property version   "5.02" 
+#property description "Fixed: Daily Target mencakup Floating + Realized Profit"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -47,6 +46,7 @@ input group "=== Trade Management ==="
 input int    MagicNumber     = 144406;    
 input int    MaxDailyTrades  = 10;        
 double MaxDailyLossPct = 5.0;       
+input double DailyTargetProfitUSD = 10.0;  // TARGET PROFIT HARIAN (DEFAULT $10)
 
 input group "=== Partial Close Settings ==="
 input bool  UsePartialClose = true;
@@ -65,7 +65,7 @@ double last_sell_ob_low = 0;
 //--- Global Variables
 datetime last_trade_time = 0;
 datetime daily_reset_time = 0;
-double daily_profit = 0.0;
+double daily_closed_profit = 0.0; // Hanya menyimpan profit dari trade yang SUDAH close
 int daily_trades = 0;
 
 //--- Dashboard Variables
@@ -97,7 +97,8 @@ int OnInit()
    }
    
    Print("=== Arrow Trader Initialized ===");
-   Print("Logic: Green Arrow (Buy) / Red Arrow (Sell)");
+   Print("Logic: Green Arrow Buy / Red Arrow Sell");
+   Print("Daily Target: $", DoubleToString(DailyTargetProfitUSD, 2));
    
    //--- Create dashboard
    CreateDashboard();
@@ -131,14 +132,34 @@ void OnTick()
    //--- Reset daily stats
    CheckDailyReset();
    
-   //--- Check daily limits
+   //--- Hitung Total Profit Hari Ini (Floating + Closed)
+   double total_daily_pnl = daily_closed_profit;
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (position.SelectByIndex(i) && position.Symbol() == CurrentSymbol && 
+          position.Magic() == MagicNumber)
+      {
+         total_daily_pnl += (position.Profit() + position.Swap() + position.Commission());
+      }
+   }
+
+   //--- Check daily limits (Max Trades)
    if (daily_trades >= MaxDailyTrades) return;
    
+   //--- Check Max Loss
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if (daily_profit <= -(balance * MaxDailyLossPct / 100.0)) return;
+   if (total_daily_pnl <= -(balance * MaxDailyLossPct / 100.0)) return;
    
    //--- Manage existing positions (SL, TP, Trailing)
    ManagePositions();
+   
+   // --- LOGIKA TARGET PROFIT (FIXED) ---
+   // Jika Total PNL (Floating + Closed) melebihi target, STOP buka posisi baru
+   if (DailyTargetProfitUSD > 0 && total_daily_pnl >= DailyTargetProfitUSD)
+   {
+      // Tidak perlu print terus menerus, cukup di dashboard
+      return; 
+   }
    
    //--- Check if can open new trade
    int open_positions = CountOpenPositions();
@@ -163,7 +184,7 @@ void OnTick()
    }
    
    //--- Update display
-   UpdateDashboard();
+   UpdateDashboard(total_daily_pnl);
 }
 
 //+------------------------------------------------------------------+
@@ -455,7 +476,7 @@ void ManagePositions()
    for (int i = 0; i < PositionsTotal(); i++)
    {
       if (!position.SelectByIndex(i)) continue;
-      if (position.Symbol() != CurrentSymbol || position.Magic() != MagicNumber) continue;
+      if (position.Symbol() != CurrentSymbol || position.Magic() == MagicNumber) continue;
       
       double open_price = position.PriceOpen();
       double current_sl = position.StopLoss();
@@ -563,7 +584,7 @@ void CheckDailyReset()
    if (current_day != daily_reset_time)
    {
       daily_reset_time = current_day;
-      daily_profit = 0.0;
+      daily_closed_profit = 0.0; // Reset profit yang sudah close
       daily_trades = 0;
       
       HistorySelect(current_day, TimeCurrent());
@@ -573,9 +594,10 @@ void CheckDailyReset()
          if (ticket > 0 && HistoryDealGetString(ticket, DEAL_SYMBOL) == CurrentSymbol &&
              HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
          {
-            daily_profit += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+            daily_closed_profit += HistoryDealGetDouble(ticket, DEAL_PROFIT);
          }
       }
+      Print("Daily Reset. Closed Profit: $", DoubleToString(daily_closed_profit, 2));
    }
 }
 
@@ -591,7 +613,7 @@ void CreateDashboard()
       ObjectSetInteger(0, bg_name, OBJPROP_XDISTANCE, x_distance);
       ObjectSetInteger(0, bg_name, OBJPROP_YDISTANCE, y_distance);
       ObjectSetInteger(0, bg_name, OBJPROP_XSIZE, 350);
-      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 220);
+      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 240); 
       ObjectSetInteger(0, bg_name, OBJPROP_BGCOLOR, clrBlack);
       ObjectSetInteger(0, bg_name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
       ObjectSetInteger(0, bg_name, OBJPROP_COLOR, clrDodgerBlue);
@@ -600,7 +622,7 @@ void CreateDashboard()
       ObjectSetInteger(0, bg_name, OBJPROP_SELECTABLE, false);
    }
    
-   CreateLabel("Title", "ARROW TRADER BY ADAM v5.00", 15, clrDodgerBlue, 10, 10);
+   CreateLabel("Title", "ARROW TRADER BY ADAM v5.02", 15, clrDodgerBlue, 10, 10);
    CreateLabel("Strategy", "Logic: Green Arrow Buy / Red Arrow Sell", 9, clrWhite, 10, 35);
    
    CreateLabel("Balance_Label", "Balance:", 9, clrGray, 10, 60);
@@ -613,10 +635,13 @@ void CreateDashboard()
    CreateLabel("Positions_Value", "0/3", 10, clrAqua, 140, 125);
    CreateLabel("DailyTrades_Label", "Daily Trades:", 9, clrGray, 10, 145);
    CreateLabel("DailyTrades_Value", "0/10", 10, clrAqua, 140, 145);
-   CreateLabel("DailyPL_Label", "Daily P/L:", 9, clrGray, 10, 165);
-   CreateLabel("DailyPL_Value", "$0.00", 10, clrYellow, 140, 165);
-   CreateLabel("Risk_Label", "Risk per Trade:", 9, clrGray, 10, 190);
-   CreateLabel("Risk_Value", "Lot: 0.01", 10, clrOrange, 140, 190);
+   
+   // Label Target
+   CreateLabel("Target_Label", "Daily Target:", 9, clrOrange, 10, 165);
+   CreateLabel("Target_Value", "$0.00 / $10.00", 10, clrOrange, 120, 165);
+   
+   CreateLabel("Risk_Label", "Risk per Trade:", 9, clrGray, 10, 210);
+   CreateLabel("Risk_Value", "Lot: 0.01", 10, clrOrange, 140, 210);
    
    ChartRedraw();
 }
@@ -645,21 +670,19 @@ void CreateLabel(string name, string text, int font_size, color clr, int x, int 
 //+------------------------------------------------------------------+
 //| Update Dashboard Values                                           |
 //+------------------------------------------------------------------+
-void UpdateDashboard()
+void UpdateDashboard(double current_total_pnl)
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double total_profit = equity - balance;
    
    int open_positions = 0;
-   double current_pl = 0.0;
    
    for (int i = 0; i < PositionsTotal(); i++)
    {
       if (position.SelectByIndex(i) && position.Symbol() == CurrentSymbol && 
           position.Magic() == MagicNumber)
       {
-         current_pl += position.Profit() + position.Swap() + position.Commission();
          open_positions++;
       }
    }
@@ -677,9 +700,13 @@ void UpdateDashboard()
    ObjectSetString(0, dashboard_name + "_DailyTrades_Value", OBJPROP_TEXT, 
                    IntegerToString(daily_trades) + "/" + IntegerToString(MaxDailyTrades));
    
-   color daily_color = (daily_profit >= 0) ? clrLime : clrRed;
-   ObjectSetString(0, dashboard_name + "_DailyPL_Value", OBJPROP_TEXT, "$" + DoubleToString(daily_profit, 2));
-   ObjectSetInteger(0, dashboard_name + "_DailyPL_Value", OBJPROP_COLOR, daily_color);
+   // Update Target Display (Menampilkan Total PNL)
+   string target_text = "$" + DoubleToString(current_total_pnl, 2) + " / $" + DoubleToString(DailyTargetProfitUSD, 2);
+   ObjectSetString(0, dashboard_name + "_Target_Value", OBJPROP_TEXT, target_text);
+   
+   color daily_color = (current_total_pnl >= 0) ? clrLime : clrRed;
+   if (current_total_pnl >= DailyTargetProfitUSD) daily_color = clrGold; // Berubah jadi Gold jika target tercapai
+   ObjectSetInteger(0, dashboard_name + "_Target_Value", OBJPROP_COLOR, daily_color);
    
    string risk_text = UseFixedLot ? ("Lot: " + DoubleToString(FixedLotSize, 2)) : (DoubleToString(RiskPercent, 1) + "%");
    ObjectSetString(0, dashboard_name + "_Risk_Value", OBJPROP_TEXT, risk_text);
@@ -705,19 +732,11 @@ void DeleteDashboard()
    ObjectDelete(0, dashboard_name + "_Positions_Value");
    ObjectDelete(0, dashboard_name + "_DailyTrades_Label");
    ObjectDelete(0, dashboard_name + "_DailyTrades_Value");
-   ObjectDelete(0, dashboard_name + "_DailyPL_Label");
-   ObjectDelete(0, dashboard_name + "_DailyPL_Value");
+   ObjectDelete(0, dashboard_name + "_Target_Label");
+   ObjectDelete(0, dashboard_name + "_Target_Value");
    ObjectDelete(0, dashboard_name + "_Risk_Label");
    ObjectDelete(0, dashboard_name + "_Risk_Value");
    
    ChartRedraw();
-}
-
-//+------------------------------------------------------------------+
-//| Update Display (keep for compatibility)                          |
-//+------------------------------------------------------------------+
-void UpdateDisplay()
-{
-   UpdateDashboard();
 }
 //+------------------------------------------------------------------+
