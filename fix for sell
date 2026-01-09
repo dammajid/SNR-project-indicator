@@ -1,0 +1,643 @@
+//+------------------------------------------------------------------+
+//|                            XAUUSD M5 Arrow Trader EA             |
+//|                  FIXED PIPS CALCULATION (1 Pip = 10 Points)      |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI"
+#property version   "6.20" 
+#property description "M5 Scalping: Fixed Logic 1 Input Pip = 10 Points"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Global Objects
+CTrade trade;
+CPositionInfo position;
+string CurrentSymbol = _Symbol;
+ENUM_TIMEFRAMES EntryTF = PERIOD_M5;
+ENUM_TIMEFRAMES TrendTF = PERIOD_H1;
+
+//--- Input Parameters
+input group "=== Risk Management ==="
+input bool   UseFixedLot     = true;      
+input double FixedLotSize    = 0.01;      
+input double RiskPercent     = 3.0;       
+input int    StopLossPips    = 200;       // Contoh: Input 200 = 2000 Poin
+input int    TakeProfitPips  = 400;       // Contoh: Input 400 = 4000 Poin
+input int    TrailingStart   = 40;        
+input int    TrailingStop    = 20;        
+input int    BreakEvenPips   = 30;        
+
+input group "=== Trend & Arrow Settings ==="
+input int    EMA_Trend       = 100;       
+input int    MinBarsSince    = 3;          
+
+// --- RSI Filter ---
+input group "=== RSI Filter (Stability) ==="
+input bool   UseRSIFilter    = true;       
+input int    RSI_Period      = 14;
+input int    RSI_Overbought  = 60;         
+input int    RSI_Oversold    = 40;         
+
+// --- Parameter Orderblock ---
+input group "=== Orderblock (Zona Panah) Settings ==="
+input int    OB_Lookback     = 15;        
+input double OB_PullbackThreshold = 0.5;  
+
+input group "=== Pyramiding (Scalping) ==="
+input bool   UsePyramiding   = true;      
+input int    MaxPositions    = 2;          
+input int    PyramidStep     = 50;          // Input 50 = 500 Poin
+
+input group "=== Trade Management ==="
+input int    MagicNumber     = 144406;    
+input int    MaxDailyTrades  = 15;         
+double MaxDailyLossPct = 5.0;       
+input double DailyTargetProfitUSD = 15.0;  
+
+input group "=== Partial Close Settings ==="
+input bool  UsePartialClose = true;
+input double PartialClosePercent = 50.0;
+input int    PartialCloseAtPips  = 40;      // Input 40 = 400 Poin
+
+//--- Global Handles
+int h1_ema_handle;
+int rsi_handle; 
+
+// --- Variabel global untuk menyimpan Zona Support/Resistance ---
+double last_buy_ob_high = 0;
+double last_buy_ob_low = 0;
+double last_sell_ob_high = 0;
+double last_sell_ob_low = 0;
+
+//--- Global Variables
+datetime last_trade_time = 0;
+datetime daily_reset_time = 0;
+double daily_closed_profit = 0.0; 
+int daily_trades = 0;
+bool target_hit_today = false; 
+
+//--- Dashboard Variables
+string dashboard_name = "EA_Dashboard";
+int corner_position = CORNER_LEFT_UPPER;
+int x_distance = 20;
+int y_distance = 50;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if (CurrentSymbol != "XAUUSD" && CurrentSymbol != "XAUUSDm")
+   {
+      Print("WARNING: Optimized for XAUUSD");
+   }
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(50);
+   
+   //--- Create indicators
+   h1_ema_handle = iMA(CurrentSymbol, TrendTF, EMA_Trend, 0, MODE_EMA, PRICE_CLOSE);
+   
+   if(UseRSIFilter)
+   {
+      rsi_handle = iRSI(CurrentSymbol, EntryTF, RSI_Period, PRICE_CLOSE);
+      if (rsi_handle == INVALID_HANDLE)
+      {
+         Print("Error creating RSI indicator");
+         return(INIT_FAILED);
+      }
+   }
+   
+   if (h1_ema_handle == INVALID_HANDLE)
+   {
+      Print("Error creating indicators");
+      return(INIT_FAILED);
+   }
+   
+   Print("=== M5 ARROW TRADER (Fixed Logic) Initialized ===");
+   Print("Logic: 1 Input Pip = 10 Points");
+   
+   CreateDashboard();
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if (h1_ema_handle != INVALID_HANDLE) IndicatorRelease(h1_ema_handle);
+   if (rsi_handle != INVALID_HANDLE) IndicatorRelease(rsi_handle);
+   DeleteDashboard();
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   static datetime last_bar = 0;
+   datetime current_bar = iTime(CurrentSymbol, EntryTF, 0);
+   
+   if (current_bar == last_bar) return;
+   last_bar = current_bar;
+   
+   UpdateOrderblocks();
+   CheckDailyReset();
+   
+   //--- Hitung Total Profit Hari Ini
+   double total_daily_pnl = daily_closed_profit;
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (position.SelectByIndex(i) && position.Symbol() == CurrentSymbol && 
+          position.Magic() == MagicNumber)
+      {
+         total_daily_pnl += (position.Profit() + position.Swap() + position.Commission());
+      }
+   }
+
+   if (daily_trades >= MaxDailyTrades) return;
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if (total_daily_pnl <= -(balance * MaxDailyLossPct / 100.0)) return;
+   
+   ManagePositions();
+   
+   // --- LOGIKA TARGET PROFIT ---
+   if (DailyTargetProfitUSD > 0 && total_daily_pnl >= DailyTargetProfitUSD)
+   {
+      target_hit_today = true; 
+   }
+   if (target_hit_today) return;
+   
+   int open_positions = CountOpenPositions();
+   if (open_positions >= MaxPositions) return;
+   
+   if (open_positions > 0 && UsePyramiding)
+   {
+      CheckPyramidingOpportunity();
+   }
+   
+   if (open_positions == 0)
+   {
+      int bars_since = (int)((TimeCurrent() - last_trade_time) / PeriodSeconds(EntryTF));
+      if (bars_since < MinBarsSince && last_trade_time > 0) return;
+      
+      CheckArrowSignals();
+   }
+   
+   UpdateDashboard(total_daily_pnl);
+}
+
+//+------------------------------------------------------------------+
+//| Update Zona Support (Green) & Resistance (Red)                   |
+//+------------------------------------------------------------------+
+void UpdateOrderblocks()
+{
+   double current_bid = SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
+   double current_ask = SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+
+   if (last_buy_ob_high > 0 && current_bid > last_buy_ob_high)
+   {
+      last_buy_ob_high = 0; last_buy_ob_low = 0;
+   }
+   if (last_sell_ob_low > 0 && current_ask < last_sell_ob_low)
+   {
+      last_sell_ob_high = 0; last_sell_ob_low = 0;
+   }
+
+   if (last_buy_ob_high == 0 || last_sell_ob_low == 0)
+   {
+      double high[], low[], close[], open[];
+      ArraySetAsSeries(high, true); ArraySetAsSeries(low, true);
+      ArraySetAsSeries(close, true); ArraySetAsSeries(open, true);
+      
+      if (CopyHigh(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, high) < OB_Lookback + 2) return;
+      if (CopyLow(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, low) < OB_Lookback + 2) return;
+      if (CopyClose(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, close) < OB_Lookback + 2) return;
+      if (CopyOpen(CurrentSymbol, EntryTF, 0, OB_Lookback + 2, open) < OB_Lookback + 2) return;
+
+      if (last_buy_ob_high == 0)
+      {
+         double max_range = 0; int strongest_candle_index = -1;
+         for (int i = 1; i <= OB_Lookback; i++)
+         {
+            if (close[i] > open[i])
+            {
+               double candle_range = high[i] - low[i];
+               if (candle_range > max_range) { max_range = candle_range; strongest_candle_index = i; }
+            }
+         }
+         if (strongest_candle_index != -1) { last_buy_ob_high = high[strongest_candle_index]; last_buy_ob_low = low[strongest_candle_index]; }
+      }
+
+      if (last_sell_ob_low == 0)
+      {
+         double max_range = 0; int strongest_candle_index = -1;
+         for (int i = 1; i <= OB_Lookback; i++)
+         {
+            if (close[i] < open[i])
+            {
+               double candle_range = high[i] - low[i];
+               if (candle_range > max_range) { max_range = candle_range; strongest_candle_index = i; }
+            }
+         }
+         if (strongest_candle_index != -1) { last_sell_ob_high = high[strongest_candle_index]; last_sell_ob_low = low[strongest_candle_index]; }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| LOGIKA UTAMA: Cek Panah Hijau (Buy) & Merah (Sell) M5 + RSI FILTER   |
+//+------------------------------------------------------------------+
+void CheckArrowSignals()
+{
+   double h1_ema[];
+   ArraySetAsSeries(h1_ema, true);
+   if (CopyBuffer(h1_ema_handle, 0, 0, 2, h1_ema) < 2) return;
+   double h1_close = iClose(CurrentSymbol, TrendTF, 1);
+   bool h1_bullish = (h1_close > h1_ema[1]);
+   bool h1_bearish = (h1_close < h1_ema[1]);
+   
+   double open[], close[], high[], low[];
+   ArraySetAsSeries(open, true); ArraySetAsSeries(close, true);
+   ArraySetAsSeries(high, true); ArraySetAsSeries(low, true);
+   if (CopyOpen(CurrentSymbol, EntryTF, 0, 2, open) < 2) return;
+   if (CopyClose(CurrentSymbol, EntryTF, 0, 2, close) < 2) return;
+   if (CopyHigh(CurrentSymbol, EntryTF, 0, 2, high) < 2) return;
+   if (CopyLow(CurrentSymbol, EntryTF, 0, 2, low) < 2) return;
+
+   // --- RSI FILTER LOGIC ---
+   double rsi_val = 0;
+   bool rsi_pass = true;
+   if(UseRSIFilter)
+   {
+      double rsi_buf[];
+      ArraySetAsSeries(rsi_buf, true);
+      if(CopyBuffer(rsi_handle, 0, 0, 1, rsi_buf) > 0)
+      {
+         rsi_val = rsi_buf[0];
+      }
+   }
+
+   // 1. LOGIKA BUY (GREEN ARROW di M5)
+   if (h1_bullish && last_buy_ob_low > 0)
+   {
+      double ob_range = last_buy_ob_high - last_buy_ob_low;
+      double threshold = ob_range * OB_PullbackThreshold;
+      bool touched_zone = (low[1] <= last_buy_ob_high + threshold && low[1] >= last_buy_ob_low - threshold);
+      bool green_candle = (close[1] > open[1]); 
+      
+      if(UseRSIFilter) rsi_pass = (rsi_val < RSI_Overbought);
+      
+      if (touched_zone && green_candle && rsi_pass)
+      {
+         Print(">>> M5 BUY SIGNAL <<<");
+         OpenTrade(ORDER_TYPE_BUY);
+         return;
+      }
+   }
+   
+   // 2. LOGIKA SELL (RED ARROW di M5)
+   if (h1_bearish && last_sell_ob_high > 0)
+   {
+      double ob_range = last_sell_ob_high - last_sell_ob_low;
+      double threshold = ob_range * OB_PullbackThreshold;
+      bool touched_zone = (high[1] >= last_sell_ob_low - threshold && high[1] <= last_sell_ob_high + threshold);
+      bool red_candle = (close[1] < open[1]);
+      
+      if(UseRSIFilter) rsi_pass = (rsi_val > RSI_Oversold);
+      
+      if (touched_zone && red_candle && rsi_pass)
+      {
+         Print(">>> M5 SELL SIGNAL <<<");
+         OpenTrade(ORDER_TYPE_SELL);
+         return;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open Trade with FIXED PIPS CALCULATION                           |
+//+------------------------------------------------------------------+
+void OpenTrade(ENUM_ORDER_TYPE order_type)
+{
+   double point = SymbolInfoDouble(CurrentSymbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS);
+   
+   // --- FIXED LOGIC: 1 Input Pip = 10 Points ---
+   // Ini memenuhi request Anda: 1000 Poin = 100 Pips
+   double multiplier = 10.0; 
+   
+   double lot_size;
+   if (UseFixedLot) lot_size = FixedLotSize;
+   else
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double risk_money = balance * (RiskPercent / 100.0);
+      double tick_value = SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_VALUE);
+      double tick_size = SymbolInfoDouble(CurrentSymbol, SYMBOL_TRADE_TICK_SIZE);
+      // Hitung jarak poin asli untuk lot sizing
+      double sl_distance_points = StopLossPips * multiplier * point;
+      lot_size = risk_money / (sl_distance_points * tick_value / tick_size);
+   }
+   
+   double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MAX);
+   double step_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_STEP);
+   lot_size = MathFloor(lot_size / step_lot) * step_lot;
+   lot_size = NormalizeDouble(lot_size, 2);
+   if (lot_size < min_lot) lot_size = min_lot;
+   if (lot_size > max_lot) lot_size = max_lot;
+   
+   double price = (order_type == ORDER_TYPE_BUY) ? SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK) : SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
+   
+   // Hitung SL/TP Price menggunakan multiplier
+   double sl_distance = StopLossPips * multiplier * point;
+   double tp_distance = TakeProfitPips * multiplier * point;
+   
+   double sl, tp;
+   if (order_type == ORDER_TYPE_BUY)
+   {
+      sl = price - sl_distance;
+      if (TakeProfitPips > 0) tp = price + tp_distance; else tp = 0;
+   }
+   else
+   {
+      sl = price + sl_distance;
+      if (TakeProfitPips > 0) tp = price - tp_distance; else tp = 0;
+   }
+   
+   sl = NormalizeDouble(sl, digits);
+   if (tp > 0) tp = NormalizeDouble(tp, digits);
+   
+   string comment = (order_type == ORDER_TYPE_BUY) ? "M5 Arrow BUY" : "M5 Arrow SELL";
+   
+   if (order_type == ORDER_TYPE_BUY) trade.Buy(lot_size, CurrentSymbol, 0, sl, tp, comment);
+   else trade.Sell(lot_size, CurrentSymbol, 0, sl, tp, comment);
+   
+   if (trade.ResultRetcode() == TRADE_RETCODE_DONE)
+   {
+      last_trade_time = TimeCurrent();
+      daily_trades++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check Pyramiding Opportunity                                     |
+//+------------------------------------------------------------------+
+void CheckPyramidingOpportunity()
+{
+   if (!UsePyramiding) return;
+   int open_positions = CountOpenPositions();
+   if (open_positions >= MaxPositions) return;
+   
+   double point = SymbolInfoDouble(CurrentSymbol, SYMBOL_POINT);
+   double multiplier = 10.0; // Fixed Logic
+   
+   ENUM_POSITION_TYPE first_type = WRONG_VALUE;
+   double total_profit_pips = 0;
+   
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (!position.SelectByIndex(i)) continue;
+      if (position.Symbol() != CurrentSymbol || position.Magic() != MagicNumber) continue;
+      
+      if (first_type == WRONG_VALUE) first_type = position.PositionType();
+      double current_price = (position.PositionType() == POSITION_TYPE_BUY) ? SymbolInfoDouble(CurrentSymbol, SYMBOL_BID) : SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+      
+      // Hitung profit dalam 'Pips' (Input unit)
+      double profit_distance_points = (position.PositionType() == POSITION_TYPE_BUY) ? (current_price - position.PriceOpen()) : (position.PriceOpen() - current_price);
+      
+      // Konversi poin asli ke 'Pips' input (Dibagi 10 karena multiplier 10)
+      double profit_pips = profit_distance_points / (multiplier * point); 
+      
+      total_profit_pips += profit_pips;
+   }
+   
+   double avg_profit_pips = total_profit_pips / open_positions;
+   
+   if (avg_profit_pips >= PyramidStep)
+   {
+      int bars_since = (int)((TimeCurrent() - last_trade_time) / PeriodSeconds(EntryTF));
+      if (bars_since < MinBarsSince) return;
+      
+      if (first_type == POSITION_TYPE_BUY) OpenTrade(ORDER_TYPE_BUY);
+      else OpenTrade(ORDER_TYPE_SELL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage Positions (Fixed Logic)                                  |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   double point = SymbolInfoDouble(CurrentSymbol, SYMBOL_POINT);
+   double multiplier = 10.0; // Fixed Logic
+   
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (!position.SelectByIndex(i)) continue;
+      if (position.Symbol() != CurrentSymbol || position.Magic() != MagicNumber) continue;
+      
+      double open_price = position.PriceOpen();
+      double current_sl = position.StopLoss();
+      ulong ticket = position.Ticket();
+      double current_volume = position.Volume(); 
+      
+      if (UsePartialClose)
+      {
+         double current_price = (position.PositionType() == POSITION_TYPE_BUY) ? SymbolInfoDouble(CurrentSymbol, SYMBOL_BID) : SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+         double profit_distance_points = (position.PositionType() == POSITION_TYPE_BUY) ? (current_price - open_price) : (open_price - current_price);
+         double profit_pips = profit_distance_points / (multiplier * point);
+         double initial_lot = UseFixedLot ? FixedLotSize : 0.01; 
+         
+         if (profit_pips >= PartialCloseAtPips && MathAbs(current_volume - initial_lot) < 0.001)
+         {
+            double volume_to_close = NormalizeDouble(current_volume * (PartialClosePercent / 100.0), 2);
+            double min_lot = SymbolInfoDouble(CurrentSymbol, SYMBOL_VOLUME_MIN);
+            if (volume_to_close >= min_lot)
+            {
+               if (trade.PositionClosePartial(ticket, volume_to_close))
+               {
+                  if(position.SelectByIndex(i))
+                  {
+                     double new_sl = open_price; new_sl = NormalizeDouble(new_sl, (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS));
+                     trade.PositionModify(ticket, new_sl, position.TakeProfit());
+                  }
+               }
+               continue;
+            }
+         }
+      }
+      
+      if (position.PositionType() == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(CurrentSymbol, SYMBOL_BID);
+         double profit_distance_points = bid - open_price;
+         double profit_pips = profit_distance_points / (multiplier * point);
+         
+         if (profit_pips >= BreakEvenPips && current_sl < open_price)
+         {
+            double new_sl = open_price + (point); new_sl = NormalizeDouble(new_sl, (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS));
+            trade.PositionModify(ticket, new_sl, position.TakeProfit());
+         }
+         
+         if (profit_pips >= TrailingStart) 
+         {
+            double new_sl = bid - (TrailingStop * multiplier * point); new_sl = NormalizeDouble(new_sl, (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS));
+            if (new_sl > current_sl && new_sl < bid) trade.PositionModify(ticket, new_sl, position.TakeProfit());
+         }
+      }
+      else // SELL
+      {
+         double ask = SymbolInfoDouble(CurrentSymbol, SYMBOL_ASK);
+         double profit_distance_points = open_price - ask;
+         double profit_pips = profit_distance_points / (multiplier * point);
+         
+         if (profit_pips >= BreakEvenPips && (current_sl == 0 || current_sl > open_price))
+         {
+            double new_sl = open_price - (point); new_sl = NormalizeDouble(new_sl, (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS));
+            trade.PositionModify(ticket, new_sl, position.TakeProfit());
+         }
+         
+         if (profit_pips >= TrailingStart) 
+         {
+            double new_sl = ask + (TrailingStop * multiplier * point); new_sl = NormalizeDouble(new_sl, (int)SymbolInfoInteger(CurrentSymbol, SYMBOL_DIGITS));
+            if ((current_sl == 0 || new_sl < current_sl) && new_sl > ask) trade.PositionModify(ticket, new_sl, position.TakeProfit());
+         }
+      }
+   }
+}
+
+int CountOpenPositions()
+{
+   int count = 0;
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (position.SelectByIndex(i) && position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber) count++;
+   }
+   return count;
+}
+
+void CheckDailyReset()
+{
+   datetime current_day = iTime(CurrentSymbol, PERIOD_D1, 0);
+   if (current_day != daily_reset_time)
+   {
+      daily_reset_time = current_day;
+      daily_closed_profit = 0.0; 
+      daily_trades = 0;
+      target_hit_today = false; 
+      
+      HistorySelect(current_day, TimeCurrent());
+      for (int i = 0; i < HistoryDealsTotal(); i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if (ticket > 0 && HistoryDealGetString(ticket, DEAL_SYMBOL) == CurrentSymbol && HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
+         {
+            daily_closed_profit += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         }
+      }
+   }
+}
+
+void CreateDashboard()
+{
+   string bg_name = dashboard_name + "_BG";
+   if (ObjectCreate(0, bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+   {
+      ObjectSetInteger(0, bg_name, OBJPROP_CORNER, corner_position);
+      ObjectSetInteger(0, bg_name, OBJPROP_XDISTANCE, x_distance);
+      ObjectSetInteger(0, bg_name, OBJPROP_YDISTANCE, y_distance);
+      ObjectSetInteger(0, bg_name, OBJPROP_XSIZE, 350);
+      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 220); 
+      ObjectSetInteger(0, bg_name, OBJPROP_BGCOLOR, clrBlack);
+      ObjectSetInteger(0, bg_name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, bg_name, OBJPROP_COLOR, clrDodgerBlue);
+      ObjectSetInteger(0, bg_name, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, bg_name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, bg_name, OBJPROP_SELECTABLE, false);
+   }
+   
+   CreateLabel("Title", "M5 ARROW TRADER v6.20", 15, clrDodgerBlue, 10, 10);
+   CreateLabel("Strategy", "Fixed Logic: 1 Pip Input = 10 Points", 9, clrWhite, 10, 35);
+   CreateLabel("Balance_Label", "Balance:", 9, clrGray, 10, 60);
+   CreateLabel("Balance_Value", "$0.00", 10, clrLime, 120, 60);
+   CreateLabel("Equity_Label", "Equity:", 9, clrGray, 10, 80);
+   CreateLabel("Equity_Value", "$0.00", 10, clrLime, 120, 80);
+   CreateLabel("Profit_Label", "Total Profit:", 9, clrGray, 10, 100);
+   CreateLabel("Profit_Value", "$0.00", 10, clrYellow, 120, 100);
+   CreateLabel("Positions_Label", "Open Positions:", 9, clrGray, 10, 125);
+   CreateLabel("Positions_Value", "0/2", 10, clrAqua, 140, 125);
+   CreateLabel("DailyTrades_Label", "Daily Trades:", 9, clrGray, 10, 145);
+   CreateLabel("DailyTrades_Value", "0/15", 10, clrAqua, 140, 145);
+   CreateLabel("Target_Label", "Daily Target:", 9, clrOrange, 10, 165);
+   CreateLabel("Target_Value", "$0.00 / $15.00", 10, clrOrange, 120, 165);
+   CreateLabel("Risk_Label", "Risk per Trade:", 9, clrGray, 10, 190);
+   CreateLabel("Risk_Value", "Lot: 0.01", 10, clrOrange, 140, 190);
+   ChartRedraw();
+}
+
+void CreateLabel(string name, string text, int font_size, color clr, int x, int y)
+{
+   string label_name = dashboard_name + "_" + name;
+   if (ObjectCreate(0, label_name, OBJ_LABEL, 0, 0, 0))
+   {
+      ObjectSetInteger(0, label_name, OBJPROP_CORNER, corner_position);
+      ObjectSetInteger(0, label_name, OBJPROP_XDISTANCE, x_distance + x);
+      ObjectSetInteger(0, label_name, OBJPROP_YDISTANCE, y_distance + y);
+      ObjectSetString(0, label_name, OBJPROP_TEXT, text);
+      ObjectSetString(0, label_name, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, label_name, OBJPROP_FONTSIZE, font_size);
+      ObjectSetInteger(0, label_name, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, label_name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, label_name, OBJPROP_SELECTABLE, false);
+   }
+}
+
+void UpdateDashboard(double current_total_pnl)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double total_profit = equity - balance;
+   int open_positions = 0;
+   
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (position.SelectByIndex(i) && position.Symbol() == CurrentSymbol && position.Magic() == MagicNumber) open_positions++;
+   }
+   
+   ObjectSetString(0, dashboard_name + "_Balance_Value", OBJPROP_TEXT, "$" + DoubleToString(balance, 2));
+   ObjectSetString(0, dashboard_name + "_Equity_Value", OBJPROP_TEXT, "$" + DoubleToString(equity, 2));
+   color profit_color = (total_profit >= 0) ? clrLime : clrRed;
+   ObjectSetString(0, dashboard_name + "_Profit_Value", OBJPROP_TEXT, "$" + DoubleToString(total_profit, 2));
+   ObjectSetInteger(0, dashboard_name + "_Profit_Value", OBJPROP_COLOR, profit_color);
+   ObjectSetString(0, dashboard_name + "_Positions_Value", OBJPROP_TEXT, IntegerToString(open_positions) + "/" + IntegerToString(MaxPositions));
+   ObjectSetString(0, dashboard_name + "_DailyTrades_Value", OBJPROP_TEXT, IntegerToString(daily_trades) + "/" + IntegerToString(MaxDailyTrades));
+   
+   string target_text = "$" + DoubleToString(current_total_pnl, 2) + " / $" + DoubleToString(DailyTargetProfitUSD, 2);
+   ObjectSetString(0, dashboard_name + "_Target_Value", OBJPROP_TEXT, target_text);
+   color daily_color = (current_total_pnl >= 0) ? clrLime : clrRed;
+   if (current_total_pnl >= DailyTargetProfitUSD) daily_color = clrGold; 
+   ObjectSetInteger(0, dashboard_name + "_Target_Value", OBJPROP_COLOR, daily_color);
+   
+   string risk_text = UseFixedLot ? ("Lot: " + DoubleToString(FixedLotSize, 2)) : (DoubleToString(RiskPercent, 1) + "%");
+   ObjectSetString(0, dashboard_name + "_Risk_Value", OBJPROP_TEXT, risk_text);
+   ChartRedraw();
+}
+
+void DeleteDashboard()
+{
+   ObjectDelete(0, dashboard_name + "_BG");
+   ObjectDelete(0, dashboard_name + "_Title"); ObjectDelete(0, dashboard_name + "_Strategy");
+   ObjectDelete(0, dashboard_name + "_Balance_Label"); ObjectDelete(0, dashboard_name + "_Balance_Value");
+   ObjectDelete(0, dashboard_name + "_Equity_Label"); ObjectDelete(0, dashboard_name + "_Equity_Value");
+   ObjectDelete(0, dashboard_name + "_Profit_Label"); ObjectDelete(0, dashboard_name + "_Profit_Value");
+   ObjectDelete(0, dashboard_name + "_Positions_Label"); ObjectDelete(0, dashboard_name + "_Positions_Value");
+   ObjectDelete(0, dashboard_name + "_DailyTrades_Label"); ObjectDelete(0, dashboard_name + "_DailyTrades_Value");
+   ObjectDelete(0, dashboard_name + "_Target_Label"); ObjectDelete(0, dashboard_name + "_Target_Value");
+   ObjectDelete(0, dashboard_name + "_Risk_Label"); ObjectDelete(0, dashboard_name + "_Risk_Value");
+   ChartRedraw();
+}
