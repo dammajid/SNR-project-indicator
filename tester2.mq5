@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//|                                    XAUUSD_OB_BB_EA_V3_Loose.mq5  |
+//|                                    XAUUSD_OB_BB_EA_V4_Optimized.mq5 |
 //|                                    Algorithmic Trading Developer  |
 //+------------------------------------------------------------------+
 #property copyright "Algorithmic Trading Developer"
-#property version   "1.06"
+#property version   "1.07"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -19,10 +19,15 @@ input int    InpBB_Period        = 20;       // Bollinger Bands Period
 input double InpBB_Dev           = 2.0;      // Bollinger Bands Deviation
 input bool   InpShowVisuals      = true;     // Show Order Block Boxes
 
+// FREQUENCY OPTIMIZATION SETTINGS
+input int    InpMaxTradesPerSession = 3;     // Max Trades allowed per Session (0 = Unlimited)
+input int    InpOB_Expansion       = 100;    // EXPAND OB ZONE (Points) - Helps price enter the zone
+input int    InpCooldownMinutes    = 30;     // Minutes to wait after a trade before taking another
+
 // FILTER SETTINGS
-input bool   InpRespectSessionBias = true;    // TRUE = Strict Filter (H1 Rule), FALSE = Ignore Bias (Trade All)
+input bool   InpRespectSessionBias = true;    // TRUE = Strict Filter (H1 Rule), FALSE = Ignore Bias
 input bool   InpVerboseLogs      = true;     // Print status in Experts tab
-input bool   InpBypassBBFilter   = false;    // TRUE = Ignore BB check
+input bool   InpBypassBBFilter   = false;    // TRUE = Ignore BB check (More entries)
 
 // Session Inputs (Server Time - usually GMT+2/+3)
 input int    InpLondonStart      = 7;        // London Start Hour
@@ -50,6 +55,8 @@ MqlRates h1_rates[];
 enum ENUM_BIAS { BIAS_NONE, BIAS_BUY, BIAS_SELL };
 ENUM_BIAS g_sessionBias = BIAS_NONE;
 datetime g_lastSessionDay = 0;
+int g_tradesCountSession = 0;
+datetime g_lastTradeTime = 0;
 
 // Order Block Structure
 struct OrderBlock {
@@ -63,7 +70,7 @@ struct OrderBlock {
 OrderBlock g_ob_list[];
 
 // Trade Management
-bool g_tradeTakenThisSession = false;
+// Removed: g_tradeTakenThisSession (Replaced with counter)
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -97,7 +104,7 @@ int OnInit()
         g_ob_list[i].is_active = false;
     }
     
-    Print("EA V3 Initialized. Loose Bias Logic Active.");
+    Print("EA V4 Initialized. Optimized for Frequency.");
     return(INIT_SUCCEEDED);
 }
 
@@ -133,14 +140,34 @@ void OnTick()
     
     MqlDateTime dt;
     TimeToStruct(TimeCurrent(), dt);
+    
+    // Reset Logic on New Day
     if(dt.day != g_lastSessionDay) {
-        g_sessionBias = BIAS_NONE; // Reset daily
-        g_tradeTakenThisSession = false;
+        g_sessionBias = BIAS_NONE; 
+        g_tradesCountSession = 0;
         g_lastSessionDay = dt.day;
-        if(InpVerboseLogs) Print("New Day Detected. Bias Reset.");
+        if(InpVerboseLogs) Print("New Day Detected. Counters Reset.");
+    }
+    // Reset Logic on New Session (London to NY transition) - Simple Approximation
+    // If hour is 12 (NY Start), reset counter if we want separate session limits
+    if(dt.hour == InpNYStart && g_tradesCountSession > 0) {
+        g_tradesCountSession = 0;
+        Print("New Session Started. Counter Reset.");
     }
     
-    // CHECK BIAS: Keep checking until it finds a direction (Don't stop if NONE)
+    // Check Limit
+    if(InpMaxTradesPerSession > 0 && g_tradesCountSession >= InpMaxTradesPerSession) {
+        Comment("Max Trades per Session Reached.");
+        return;
+    }
+    
+    // Check Cooldown
+    if(InpCooldownMinutes > 0 && (TimeCurrent() - g_lastTradeTime) < (InpCooldownMinutes * 60)) {
+        Comment("Cooldown Period. Waiting...");
+        return;
+    }
+    
+    // H1 Bias
     if(InpRespectSessionBias) {
         DetermineH1Bias();
     }
@@ -155,10 +182,10 @@ void OnTick()
         lastBarTime = currentBarTime;
     }
     
-    if(PositionsTotal() == 0 && !g_tradeTakenThisSession) {
+    if(PositionsTotal() == 0) {
         CheckEntrySignal_Debug();
     } else {
-        Comment("Trade ACTIVE or Session Limit Reached.");
+        Comment("Position Open.");
     }
 }
 
@@ -181,35 +208,28 @@ bool IsSpreadAcceptable()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Determine H1 Bias (FIXED: Loose Logic)                     |
+//| Logic: Determine H1 Bias                                          |
 //+------------------------------------------------------------------+
 void DetermineH1Bias()
 {
-    // If we already have a bias, keep it (Session Locked)
     if(g_sessionBias != BIAS_NONE) return;
-
     if(CopyBuffer(h_H1_EMA, 0, 0, 3, h1_ema_val) < 3) return;
     
     double close1 = h1_rates[1].close;
     double ema_curr = h1_ema_val[0];
     
-    // LOOSE LOGIC:
-    // Just check where price is relative to EMA 50. Simple.
-    
     if(close1 > ema_curr) {
         g_sessionBias = BIAS_BUY;
-        Print("H1 BIAS set to BUY (Price > EMA). Price: ", close1, " EMA: ", ema_curr);
+        Print("H1 BIAS set to BUY (Price > EMA).");
     }
     else if(close1 < ema_curr) {
         g_sessionBias = BIAS_SELL;
-        Print("H1 BIAS set to SELL (Price < EMA). Price: ", close1, " EMA: ", ema_curr);
-    } else {
-        // If Price exactly equals EMA (rare), do nothing and check again next tick
+        Print("H1 BIAS set to SELL (Price < EMA).");
     }
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Detect Order Blocks                                         |
+//| Logic: Detect Order Blocks (M5)                                   |
 //+------------------------------------------------------------------+
 void DetectOrderBlocks()
 {
@@ -288,7 +308,7 @@ void ValidateOrderBlocks()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Visualize OBs                                               |
+//| Logic: Visualize OBs (Include Expansion)                           |
 //+------------------------------------------------------------------+
 void DrawVisuals()
 {
@@ -301,13 +321,18 @@ void DrawVisuals()
         int width = (g_ob_list[i].is_active) ? 2 : 1;
         long style = (g_ob_list[i].is_active) ? STYLE_SOLID : STYLE_DOT;
         
+        // Visualizing the EXPANDED zone
+        double expansionPoints = InpOB_Expansion * _Point;
+        double visHigh = g_ob_list[i].price_high + expansionPoints;
+        double visLow = g_ob_list[i].price_low - expansionPoints;
+        
         datetime endTime = g_ob_list[i].time + PeriodSeconds(PERIOD_M5) * 20; 
         
         if(ObjectFind(0, g_ob_list[i].obj_name) >= 0) {
             ObjectDelete(0, g_ob_list[i].obj_name);
         }
         
-        ObjectCreate(0, g_ob_list[i].obj_name, OBJ_RECTANGLE, 0, g_ob_list[i].time, g_ob_list[i].price_high, endTime, g_ob_list[i].price_low);
+        ObjectCreate(0, g_ob_list[i].obj_name, OBJ_RECTANGLE, 0, g_ob_list[i].time, visHigh, endTime, visLow);
         ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_COLOR, clr);
         ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_FILL, true);
         ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_BACK, true);
@@ -317,7 +342,7 @@ void DrawVisuals()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: DEBUG Check Entry Signal                                    |
+//| Logic: Check Entry Signal (With Expansion)                         |
 //+------------------------------------------------------------------+
 void CheckEntrySignal_Debug()
 {
@@ -328,18 +353,20 @@ void CheckEntrySignal_Debug()
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double prevClose = m5_rates[1].close;
     
-    string debugText = "=== DEBUG STATUS V3 ===\n";
+    string debugText = "=== DEBUG STATUS V4 ===\n";
     
     if(InpRespectSessionBias) {
         debugText += "Bias: " + EnumToString(g_sessionBias) + "\n";
         if(g_sessionBias == BIAS_NONE) {
-            debugText += "[WAITING FOR H1 BIAS...]\n";
+            debugText += "[WAITING FOR BIAS...]\n";
             Comment(debugText);
             return;
         }
     } else {
-        debugText += "Bias: DISABLED (Trading All Signals)\n";
+        debugText += "Bias: DISABLED\n";
     }
+    
+    debugText += "Session Trades: " + IntegerToString(g_tradesCountSession) + "/" + IntegerToString(InpMaxTradesPerSession) + "\n";
     
     bool foundCandidate = false;
     string failReason = "";
@@ -351,7 +378,12 @@ void CheckEntrySignal_Debug()
         if(!foundCandidate) {
             foundCandidate = true;
             
-            // 1. Check Bias (Only if enabled)
+            // CALCULATE EXPANDED ZONE
+            double expansion = InpOB_Expansion * _Point;
+            double zoneHigh = g_ob_list[i].price_high + expansion;
+            double zoneLow  = g_ob_list[i].price_low - expansion;
+            
+            // 1. Bias Check
             bool biasOk = true;
             if(InpRespectSessionBias) {
                 if(g_ob_list[i].is_bullish && g_sessionBias != BIAS_BUY) biasOk = false;
@@ -361,25 +393,25 @@ void CheckEntrySignal_Debug()
             debugText += "1. Bias Match: " + (biasOk ? "YES" : "NO") + "\n";
             if(!biasOk) { failReason = "Bias Mismatch"; continue; }
             
-            // 2. Check Zone & Retrace
+            // 2. Check EXPANDED Zone & Retrace
             bool insideZone = false;
             double penetration = 0;
-            double obHeight = g_ob_list[i].price_high - g_ob_list[i].price_low;
+            double obHeight = zoneHigh - zoneLow; // Use expanded height for retrace calc
             
             if(g_ob_list[i].is_bullish) {
-                insideZone = (ask >= g_ob_list[i].price_low && ask <= g_ob_list[i].price_high);
-                penetration = (ask - g_ob_list[i].price_low) / obHeight;
+                insideZone = (ask >= zoneLow && ask <= zoneHigh);
+                penetration = (ask - zoneLow) / obHeight;
             } else {
-                insideZone = (bid <= g_ob_list[i].price_high && bid >= g_ob_list[i].price_low);
-                penetration = (g_ob_list[i].price_high - bid) / obHeight;
+                insideZone = (bid <= zoneHigh && bid >= zoneLow);
+                penetration = (zoneHigh - bid) / obHeight;
             }
             
             bool retraceOk = (penetration >= 0.5);
             
-            debugText += "2. In Zone: " + (insideZone ? "YES" : "NO") + "\n";
-            if(!insideZone) { failReason = "Price not in OB Zone"; continue; }
+            debugText += "2. In Expanded Zone: " + (insideZone ? "YES" : "NO") + "\n";
+            if(!insideZone) { failReason = "Price not in Expanded Zone"; continue; }
             
-            debugText += "   Retrace: " + DoubleToString(penetration*100, 1) + "% (Min 50%)\n";
+            debugText += "   Retrace: " + DoubleToString(penetration*100, 1) + "%\n";
             if(!retraceOk) { failReason = "Retrace < 50%"; continue; }
             
             // 3. BB Confirmation
@@ -403,6 +435,7 @@ void CheckEntrySignal_Debug()
             debugText += "\n>>> EXECUTING TRADE! <<<";
             Comment(debugText);
             
+            // Calculate SL based on REAL OB (Not expanded)
             if(g_ob_list[i].is_bullish) {
                 double sl = g_ob_list[i].price_low - (InpStopLossBuffer * _Point);
                 ExecuteTrade(i, true, ask, sl, obHeight);
@@ -435,18 +468,23 @@ void ExecuteTrade(int obIndex, bool isBuy, double entry, double sl, double riskD
     if(isBuy) {
         if(trade.Buy(lots, _Symbol, entry, sl, tp, "OB_Buy")) {
             Print("Order BUY Placed.");
-            g_tradeTakenThisSession = true;
+            g_tradesCountSession++;
+            g_lastTradeTime = TimeCurrent();
             g_ob_list[obIndex].is_active = false;
         }
     } else {
         if(trade.Sell(lots, _Symbol, entry, sl, tp, "OB_Sell")) {
             Print("Order SELL Placed.");
-            g_tradeTakenThisSession = true;
+            g_tradesCountSession++;
+            g_lastTradeTime = TimeCurrent();
             g_ob_list[obIndex].is_active = false;
         }
     }
 }
 
+//+------------------------------------------------------------------+
+//| Helper: Calculate Lot Size                                        |
+//+------------------------------------------------------------------+
 double CalculateLotSize(double slDistance)
 {
     double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
