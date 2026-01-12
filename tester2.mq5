@@ -1,9 +1,10 @@
+
 //+------------------------------------------------------------------+
-//|                                    XAUUSD_OB_BB_EA_V4_Optimized.mq5 |
+//|                               XAUUSD_OB_BB_EA_V4_3_TestMode.mq5|
 //|                                    Algorithmic Trading Developer  |
 //+------------------------------------------------------------------+
 #property copyright "Algorithmic Trading Developer"
-#property version   "1.07"
+#property version   "1.09"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -19,17 +20,21 @@ input int    InpBB_Period        = 20;       // Bollinger Bands Period
 input double InpBB_Dev           = 2.0;      // Bollinger Bands Deviation
 input bool   InpShowVisuals      = true;     // Show Order Block Boxes
 
-// FREQUENCY OPTIMIZATION SETTINGS
-input int    InpMaxTradesPerSession = 3;     // Max Trades allowed per Session (0 = Unlimited)
-input int    InpOB_Expansion       = 100;    // EXPAND OB ZONE (Points) - Helps price enter the zone
-input int    InpCooldownMinutes    = 30;     // Minutes to wait after a trade before taking another
+// FREQUENCY & TEST SETTINGS
+input int    InpMaxTradesPerSession = 3;     // Max Trades allowed per Session
+input int    InpOB_Expansion       = 200;    // EXPAND OB ZONE (Points)
+input int    InpCooldownMinutes    = 10;     // Minutes to wait after a trade
+
+// TEST MODE SETTINGS
+// Jika FALSE: EA akan entry SEGERA saat OB terbentuk, tanpa menunggu harga masuk zona
+input bool   InpCheckZoneEntry    = false;    // FALSE = Ignore Zone Price (Test Mode)
 
 // FILTER SETTINGS
-input bool   InpRespectSessionBias = true;    // TRUE = Strict Filter (H1 Rule), FALSE = Ignore Bias
-input bool   InpVerboseLogs      = true;     // Print status in Experts tab
-input bool   InpBypassBBFilter   = false;    // TRUE = Ignore BB check (More entries)
+input bool   InpRespectSessionBias = true;    // TRUE = Use M15 Rule
+input bool   InpVerboseLogs      = true;     // Print status
+input bool   InpBypassBBFilter   = true;     // TRUE = Ignore BB check
 
-// Session Inputs (Server Time - usually GMT+2/+3)
+// Session Inputs (Server Time - GMT+2/+3)
 input int    InpLondonStart      = 7;        // London Start Hour
 input int    InpLondonEnd        = 11;       // London End Hour
 input int    InpNYStart          = 12;       // New York Start Hour
@@ -38,27 +43,22 @@ input int    InpNYEnd            = 16;       // New York End Hour
 //--- Global Variables
 CTrade trade;
 
-// Indikator Handles
-int h_H1_EMA;        
+int h_M15_EMA;        
 int h_M5_BB;         
 
-// Indikator Buffers
-double h1_ema_val[];
+double m15_ema_val[];
 double m5_bb_upper[];
 double m5_bb_lower[];
 
-// Price Data Arrays
 MqlRates m5_rates[]; 
-MqlRates h1_rates[]; 
+MqlRates m15_rates[]; 
 
-// Bias Management
 enum ENUM_BIAS { BIAS_NONE, BIAS_BUY, BIAS_SELL };
 ENUM_BIAS g_sessionBias = BIAS_NONE;
 datetime g_lastSessionDay = 0;
 int g_tradesCountSession = 0;
 datetime g_lastTradeTime = 0;
 
-// Order Block Structure
 struct OrderBlock {
     datetime time;
     double price_high;
@@ -69,9 +69,6 @@ struct OrderBlock {
 };
 OrderBlock g_ob_list[];
 
-// Trade Management
-// Removed: g_tradeTakenThisSession (Replaced with counter)
-
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
@@ -79,9 +76,9 @@ int OnInit()
 {
     trade.SetExpertMagicNumber(InpMagicNum);
     
-    h_H1_EMA = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
-    if(h_H1_EMA == INVALID_HANDLE) {
-        Print("Error creating H1 EMA handle");
+    h_M15_EMA = iMA(_Symbol, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE);
+    if(h_M15_EMA == INVALID_HANDLE) {
+        Print("Error creating M15 EMA handle");
         return(INIT_FAILED);
     }
     
@@ -91,11 +88,11 @@ int OnInit()
         return(INIT_FAILED);
     }
     
-    ArraySetAsSeries(h1_ema_val, true);
+    ArraySetAsSeries(m15_ema_val, true);
     ArraySetAsSeries(m5_bb_upper, true);
     ArraySetAsSeries(m5_bb_lower, true);
     ArraySetAsSeries(m5_rates, true);
-    ArraySetAsSeries(h1_rates, true);
+    ArraySetAsSeries(m15_rates, true);
     
     ArrayResize(g_ob_list, InpOB_Lookback);
     
@@ -104,7 +101,7 @@ int OnInit()
         g_ob_list[i].is_active = false;
     }
     
-    Print("EA V4 Initialized. Optimized for Frequency.");
+    Print("EA V4.3 Test Mode Initialized. Zone Entry Check: ", (InpCheckZoneEntry ? "ON" : "OFF"));
     return(INIT_SUCCEEDED);
 }
 
@@ -113,7 +110,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    IndicatorRelease(h_H1_EMA);
+    IndicatorRelease(h_M15_EMA);
     IndicatorRelease(h_M5_BB);
     ObjectsDeleteAll(0, "OB_"); 
     Comment(""); 
@@ -125,7 +122,7 @@ void OnDeinit(const int reason)
 void OnTick()
 {
     if(CopyRates(_Symbol, PERIOD_M5, 0, InpOB_Lookback + 5, m5_rates) < 10) return;
-    if(CopyRates(_Symbol, PERIOD_H1, 0, 5, h1_rates) < 5) return;
+    if(CopyRates(_Symbol, PERIOD_M15, 0, 5, m15_rates) < 5) return;
 
     if(!IsSessionActive()) {
         Comment("Market CLOSED / Outside Session");
@@ -141,35 +138,30 @@ void OnTick()
     MqlDateTime dt;
     TimeToStruct(TimeCurrent(), dt);
     
-    // Reset Logic on New Day
     if(dt.day != g_lastSessionDay) {
         g_sessionBias = BIAS_NONE; 
         g_tradesCountSession = 0;
         g_lastSessionDay = dt.day;
         if(InpVerboseLogs) Print("New Day Detected. Counters Reset.");
     }
-    // Reset Logic on New Session (London to NY transition) - Simple Approximation
-    // If hour is 12 (NY Start), reset counter if we want separate session limits
+    
     if(dt.hour == InpNYStart && g_tradesCountSession > 0) {
         g_tradesCountSession = 0;
         Print("New Session Started. Counter Reset.");
     }
     
-    // Check Limit
     if(InpMaxTradesPerSession > 0 && g_tradesCountSession >= InpMaxTradesPerSession) {
         Comment("Max Trades per Session Reached.");
         return;
     }
     
-    // Check Cooldown
     if(InpCooldownMinutes > 0 && (TimeCurrent() - g_lastTradeTime) < (InpCooldownMinutes * 60)) {
         Comment("Cooldown Period. Waiting...");
         return;
     }
     
-    // H1 Bias
     if(InpRespectSessionBias) {
-        DetermineH1Bias();
+        DetermineM15Bias();
     }
     
     static datetime lastBarTime = 0;
@@ -208,23 +200,23 @@ bool IsSpreadAcceptable()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Determine H1 Bias                                          |
+//| Logic: Determine M15 Bias                                        |
 //+------------------------------------------------------------------+
-void DetermineH1Bias()
+void DetermineM15Bias()
 {
     if(g_sessionBias != BIAS_NONE) return;
-    if(CopyBuffer(h_H1_EMA, 0, 0, 3, h1_ema_val) < 3) return;
+    if(CopyBuffer(h_M15_EMA, 0, 0, 3, m15_ema_val) < 3) return;
     
-    double close1 = h1_rates[1].close;
-    double ema_curr = h1_ema_val[0];
+    double close1 = m15_rates[1].close;
+    double ema_curr = m15_ema_val[0];
     
     if(close1 > ema_curr) {
         g_sessionBias = BIAS_BUY;
-        Print("H1 BIAS set to BUY (Price > EMA).");
+        Print("M15 BIAS set to BUY (Price > EMA).");
     }
     else if(close1 < ema_curr) {
         g_sessionBias = BIAS_SELL;
-        Print("H1 BIAS set to SELL (Price < EMA).");
+        Print("M15 BIAS set to SELL (Price < EMA).");
     }
 }
 
@@ -308,7 +300,7 @@ void ValidateOrderBlocks()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Visualize OBs (Include Expansion)                           |
+//| Logic: Visualize OBs                                             |
 //+------------------------------------------------------------------+
 void DrawVisuals()
 {
@@ -321,7 +313,6 @@ void DrawVisuals()
         int width = (g_ob_list[i].is_active) ? 2 : 1;
         long style = (g_ob_list[i].is_active) ? STYLE_SOLID : STYLE_DOT;
         
-        // Visualizing the EXPANDED zone
         double expansionPoints = InpOB_Expansion * _Point;
         double visHigh = g_ob_list[i].price_high + expansionPoints;
         double visLow = g_ob_list[i].price_low - expansionPoints;
@@ -342,7 +333,7 @@ void DrawVisuals()
 }
 
 //+------------------------------------------------------------------+
-//| Logic: Check Entry Signal (With Expansion)                         |
+//| Logic: Check Entry Signal (TEST MODE: Zone Check Bypassed)       |
 //+------------------------------------------------------------------+
 void CheckEntrySignal_Debug()
 {
@@ -353,12 +344,13 @@ void CheckEntrySignal_Debug()
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double prevClose = m5_rates[1].close;
     
-    string debugText = "=== DEBUG STATUS V4 ===\n";
+    string debugText = "=== DEBUG STATUS V4.3 (TEST MODE) ===\n";
+    debugText += "Zone Entry Check: " + (InpCheckZoneEntry ? "ENABLED" : "DISABLED") + "\n";
     
     if(InpRespectSessionBias) {
         debugText += "Bias: " + EnumToString(g_sessionBias) + "\n";
         if(g_sessionBias == BIAS_NONE) {
-            debugText += "[WAITING FOR BIAS...]\n";
+            debugText += "[WAITING FOR M15 BIAS...]\n";
             Comment(debugText);
             return;
         }
@@ -378,11 +370,6 @@ void CheckEntrySignal_Debug()
         if(!foundCandidate) {
             foundCandidate = true;
             
-            // CALCULATE EXPANDED ZONE
-            double expansion = InpOB_Expansion * _Point;
-            double zoneHigh = g_ob_list[i].price_high + expansion;
-            double zoneLow  = g_ob_list[i].price_low - expansion;
-            
             // 1. Bias Check
             bool biasOk = true;
             if(InpRespectSessionBias) {
@@ -393,55 +380,67 @@ void CheckEntrySignal_Debug()
             debugText += "1. Bias Match: " + (biasOk ? "YES" : "NO") + "\n";
             if(!biasOk) { failReason = "Bias Mismatch"; continue; }
             
-            // 2. Check EXPANDED Zone & Retrace
-            bool insideZone = false;
-            double penetration = 0;
-            double obHeight = zoneHigh - zoneLow; // Use expanded height for retrace calc
+            // 2. Check Expanded Zone (BYPASSED IF FALSE)
+            bool insideZone = true; // Default True if bypassed
             
-            if(g_ob_list[i].is_bullish) {
-                insideZone = (ask >= zoneLow && ask <= zoneHigh);
-                penetration = (ask - zoneLow) / obHeight;
+            if(InpCheckZoneEntry) {
+                double expansion = InpOB_Expansion * _Point;
+                double zoneHigh = g_ob_list[i].price_high + expansion;
+                double zoneLow  = g_ob_list[i].price_low - expansion;
+                
+                if(g_ob_list[i].is_bullish) {
+                    insideZone = (ask >= zoneLow && ask <= zoneHigh);
+                } else {
+                    insideZone = (bid <= zoneHigh && bid >= zoneLow);
+                }
+                
+                debugText += "2. In Expanded Zone: " + (insideZone ? "YES" : "NO") + "\n";
+                if(!insideZone) { failReason = "Price not in Expanded Zone"; continue; }
             } else {
-                insideZone = (bid <= zoneHigh && bid >= zoneLow);
-                penetration = (zoneHigh - bid) / obHeight;
+                debugText += "2. Zone Check: BYPASSED (Using Current Price)\n";
             }
             
-            bool retraceOk = (penetration >= 0.5);
-            
-            debugText += "2. In Expanded Zone: " + (insideZone ? "YES" : "NO") + "\n";
-            if(!insideZone) { failReason = "Price not in Expanded Zone"; continue; }
-            
-            debugText += "   Retrace: " + DoubleToString(penetration*100, 1) + "%\n";
-            if(!retraceOk) { failReason = "Retrace < 50%"; continue; }
-            
-            // 3. BB Confirmation
-            bool bbOk = false;
-            if(g_ob_list[i].is_bullish) {
-                bbOk = (prevClose <= m5_bb_lower[1]);
-                debugText += "   BB Check: " + (bbOk ? "PASS" : "FAIL") + "\n";
+            // 3. BB Confirmation (Usually Bypassed)
+            bool bbOk = true; // Default True if bypassed
+            if(!InpBypassBBFilter) {
+                if(g_ob_list[i].is_bullish) {
+                    bbOk = (prevClose <= m5_bb_lower[1]);
+                    debugText += "   BB Check: " + (bbOk ? "PASS" : "FAIL") + "\n";
+                } else {
+                    bbOk = (prevClose >= m5_bb_upper[1]);
+                    debugText += "   BB Check: " + (bbOk ? "PASS" : "FAIL") + "\n";
+                }
+                if(!bbOk) { failReason = "BB Condition Failed"; continue; }
             } else {
-                bbOk = (prevClose >= m5_bb_upper[1]);
-                debugText += "   BB Check: " + (bbOk ? "PASS" : "FAIL") + "\n";
+                debugText += "   BB Check: BYPASSED\n";
             }
-            
-            if(InpBypassBBFilter) {
-                debugText += "   [BB FILTER BYPASSED]\n";
-                bbOk = true;
-            }
-            
-            if(!bbOk) { failReason = "BB Condition Failed"; continue; }
             
             // EXECUTE
-            debugText += "\n>>> EXECUTING TRADE! <<<";
+            debugText += "\n>>> EXECUTING TRADE! <<<\n";
             Comment(debugText);
             
-            // Calculate SL based on REAL OB (Not expanded)
+            // Use current price for entry if zone is ignored
+            double riskDist;
+            
             if(g_ob_list[i].is_bullish) {
                 double sl = g_ob_list[i].price_low - (InpStopLossBuffer * _Point);
-                ExecuteTrade(i, true, ask, sl, obHeight);
+                // If Zone Check is OFF, we still use OB height for RR calculation
+                riskDist = g_ob_list[i].price_high - g_ob_list[i].price_low; 
+                // Use Expanded height for risk dist if available
+                if(InpCheckZoneEntry) {
+                     double expansion = InpOB_Expansion * _Point;
+                     riskDist = (g_ob_list[i].price_high + expansion) - (g_ob_list[i].price_low - expansion);
+                }
+                
+                ExecuteTrade(i, true, ask, sl, riskDist);
             } else {
                 double sl = g_ob_list[i].price_high + (InpStopLossBuffer * _Point);
-                ExecuteTrade(i, false, bid, sl, obHeight);
+                riskDist = g_ob_list[i].price_high - g_ob_list[i].price_low;
+                if(InpCheckZoneEntry) {
+                     double expansion = InpOB_Expansion * _Point;
+                     riskDist = (g_ob_list[i].price_high + expansion) - (g_ob_list[i].price_low - expansion);
+                }
+                ExecuteTrade(i, false, bid, sl, riskDist);
             }
             return;
         }
