@@ -1,0 +1,707 @@
+//+------------------------------------------------------------------+
+//|                               XAUUSD_OB_BB_EA_V4_3_FIXED.mq5     |
+//|                                    Algorithmic Trading Developer  |
+//+------------------------------------------------------------------+
+#property copyright "Algorithmic Trading Developer"
+#property version   "1.10"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- Input Parameters
+input group "=== Risk Management ==="
+input double InpRiskPercent      = 3.0;      // Risk per trade (%)
+input double InpFixedLot         = 0.01;      // Fixed Lot (0 = use Risk %)
+input int    InpStopLossBuffer   = 2000;       // SL Buffer (Points)(broker exness)
+input int    InpMagicNum         = 889399;   // Magic Number
+input int    InpMaxSpread        = 1000;       // Max Spread (Points)(broker exness)
+input int    InpOB_Lookback      = 100;      // Bars to look back for OBs
+input int    InpBB_Period        = 20;       // Bollinger Bands Period
+input double InpBB_Dev           = 2.0;      // Bollinger Bands Deviation
+input bool   InpShowVisuals      = false;     // Show Order Block Boxes
+
+// FREQUENCY & TEST SETTINGS
+input group "=== Frequency ==="
+input int    InpMaxTradesPerSession = 3;     // Max Trades allowed per Session
+input int    InpOB_Expansion       = 200;    
+input int    InpCooldownMinutes    = 10;     
+
+// TEST MODE SETTINGS
+input bool   InpCheckZoneEntry    = false;    
+
+// FILTER SETTINGS
+input group "=== Filter Settings ==="
+input bool   InpRespectSessionBias = true;    
+input bool   InpVerboseLogs      = true;     
+input bool   InpBypassBBFilter   = true;    
+
+// NEW FIXES
+input int    InpOB_MaxAge        = 50;       
+input bool   InpAutoCleanOB      = true;
+input int    InpMinSLPoints       = 500;         
+
+// Session Inputs (Server Time - GMT+2/+3)
+input group "=== Session Settings ==="
+input int    InpLondonStart      = 7;        // London Start Hour
+input int    InpLondonEnd        = 11;       // London End Hour
+input int    InpNYStart          = 12;       // New York Start Hour
+input int    InpNYEnd            = 16;       // New York End Hour
+
+//--- Global Variables
+CTrade trade;
+
+int h_M15_EMA;        
+int h_M5_BB;         
+
+double m15_ema_val[];
+double m5_bb_upper[];
+double m5_bb_lower[];
+
+MqlRates m5_rates[]; 
+MqlRates m15_rates[]; 
+
+enum ENUM_BIAS { BIAS_NONE, BIAS_BUY, BIAS_SELL };
+ENUM_BIAS g_sessionBias = BIAS_NONE;
+datetime g_lastSessionDay = 0;
+int g_tradesCountSession = 0;
+datetime g_lastTradeTime = 0;
+
+struct OrderBlock {
+    datetime time;
+    double price_high;
+    double price_low;
+    bool is_bullish; 
+    bool is_active;
+    string obj_name;
+    int bars_since_creation;  // NEW: Track age
+};
+OrderBlock g_ob_list[];
+int g_ob_count = 0;  // NEW: Track actual count
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                     |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    trade.SetExpertMagicNumber(InpMagicNum);
+    
+    // --- SETTING VISUAL CHART (HIDE GRID & BB) ---
+    // 1. Matikan Grid (Garis-garis vertikal/horizontal)
+    ChartSetInteger(0, CHART_SHOW_GRID, false);
+    
+    // 2. Hapus Indikator Bollinger Bands dari chart (agar bersih)
+    // Catatan: EA tetap menghitung BB di background, ini hanya menghapus garisnya saja
+    ChartIndicatorDelete(0, 0, "Bollinger Bands");
+    // ------------------------------------------------
+    
+    h_M15_EMA = iMA(_Symbol, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE);
+    if(h_M15_EMA == INVALID_HANDLE) {
+        Print("Error creating M15 EMA handle");
+        return(INIT_FAILED);
+    }
+    
+    h_M5_BB = iBands(_Symbol, PERIOD_M5, InpBB_Period, 0, InpBB_Dev, PRICE_CLOSE);
+    if(h_M5_BB == INVALID_HANDLE) {
+        Print("Error creating M5 BB handle");
+        return(INIT_FAILED);
+    }
+    
+    ArraySetAsSeries(m15_ema_val, true);
+    ArraySetAsSeries(m5_bb_upper, true);
+    ArraySetAsSeries(m5_bb_lower, true);
+    ArraySetAsSeries(m5_rates, true);
+    ArraySetAsSeries(m15_rates, true);
+    
+    ArrayResize(g_ob_list, InpOB_Lookback);
+    
+    for(int i=0; i<InpOB_Lookback; i++) {
+        g_ob_list[i].time = 0;
+        g_ob_list[i].is_active = false;
+        g_ob_list[i].bars_since_creation = 0;
+    }
+    
+    Print("=== EA V4.3 FIXED Initialized (Stealth Mode) ===");
+    Print("Visuals: HIDDEN | Grid: HIDDEN | BB Lines: REMOVED");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                   |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    IndicatorRelease(h_M15_EMA);
+    IndicatorRelease(h_M5_BB);
+    ObjectsDeleteAll(0, "OB_"); 
+    Comment(""); 
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(CopyRates(_Symbol, PERIOD_M5, 0, InpOB_Lookback + 5, m5_rates) < 10) return;
+    if(CopyRates(_Symbol, PERIOD_M15, 0, 5, m15_rates) < 5) return;
+
+    if(!IsSessionActive()) {
+        Comment("Market CLOSED / Outside Session");
+        return;
+    }
+    if(!IsSpreadAcceptable()) {
+        Comment("Spread too HIGH");
+        return;
+    }
+    
+    ManageOpenTrades();
+    
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    
+    if(dt.day != g_lastSessionDay) {
+        g_sessionBias = BIAS_NONE; 
+        g_tradesCountSession = 0;
+        g_lastSessionDay = dt.day;
+        if(InpVerboseLogs) Print("New Day Detected. Counters Reset.");
+    }
+    
+    if(dt.hour == InpNYStart && g_tradesCountSession > 0) {
+        g_tradesCountSession = 0;
+        Print("New Session Started. Counter Reset.");
+    }
+    
+    if(InpMaxTradesPerSession > 0 && g_tradesCountSession >= InpMaxTradesPerSession) {
+        Comment("Max Trades per Session Reached.");
+        return;
+    }
+    
+    if(InpCooldownMinutes > 0 && (TimeCurrent() - g_lastTradeTime) < (InpCooldownMinutes * 60)) {
+        Comment("Cooldown Period. Waiting...");
+        return;
+    }
+    
+    if(InpRespectSessionBias) {
+        DetermineM15Bias();
+    }
+    
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = m5_rates[0].time; 
+    
+    if(currentBarTime != lastBarTime) {
+        // UPDATE: Aging and cleaning BEFORE detection
+        if(InpAutoCleanOB) {
+            AgeAndCleanOrderBlocks();
+        }
+        
+        DetectOrderBlocks();
+        ValidateOrderBlocks();
+        DrawVisuals(); 
+        lastBarTime = currentBarTime;
+        
+        if(InpVerboseLogs) {
+            Print("Active OBs: ", CountActiveOBs(), "/", g_ob_count);
+        }
+    }
+    
+    if(PositionsTotal() == 0) {
+        CheckEntrySignal_Debug();
+    } else {
+        Comment("Position Open.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| NEW: Age and Clean Order Blocks                                  |
+//+------------------------------------------------------------------+
+void AgeAndCleanOrderBlocks()
+{
+    int cleaned = 0;
+    
+    for(int i=0; i<InpOB_Lookback; i++) {
+        if(g_ob_list[i].time == 0) continue;
+        
+        // Increment age
+        g_ob_list[i].bars_since_creation++;
+        
+        // Clean if too old OR inactive
+        if(g_ob_list[i].bars_since_creation > InpOB_MaxAge || !g_ob_list[i].is_active) {
+            if(InpVerboseLogs && g_ob_list[i].is_active) {
+                Print("Removing OLD OB: ", TimeToString(g_ob_list[i].time), 
+                      " (Age: ", g_ob_list[i].bars_since_creation, " bars)");
+            }
+            
+            // Delete visual
+            ObjectDelete(0, g_ob_list[i].obj_name);
+            
+            // Clear slot
+            g_ob_list[i].time = 0;
+            g_ob_list[i].is_active = false;
+            g_ob_list[i].bars_since_creation = 0;
+            cleaned++;
+        }
+    }
+    
+    if(cleaned > 0 && InpVerboseLogs) {
+        Print("Cleaned ", cleaned, " old OBs. Free slots available.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| NEW: Count Active OBs                                            |
+//+------------------------------------------------------------------+
+int CountActiveOBs()
+{
+    int count = 0;
+    for(int i=0; i<InpOB_Lookback; i++) {
+        if(g_ob_list[i].time != 0 && g_ob_list[i].is_active) count++;
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Session & Spread                                          |
+//+------------------------------------------------------------------+
+bool IsSessionActive()
+{
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    int hour = dt.hour;
+    bool london = (hour >= InpLondonStart && hour < InpLondonEnd);
+    bool ny = (hour >= InpNYStart && hour < InpNYEnd);
+    return (london || ny);
+}
+bool IsSpreadAcceptable()
+{
+    double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    return (spread <= InpMaxSpread);
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Determine M15 Bias                                        |
+//+------------------------------------------------------------------+
+void DetermineM15Bias()
+{
+    if(g_sessionBias != BIAS_NONE) return;
+    if(CopyBuffer(h_M15_EMA, 0, 0, 3, m15_ema_val) < 3) return;
+    
+    double close1 = m15_rates[1].close;
+    double ema_curr = m15_ema_val[0];
+    
+    if(close1 > ema_curr) {
+        g_sessionBias = BIAS_BUY;
+        Print("M15 BIAS set to BUY (Price > EMA).");
+    }
+    else if(close1 < ema_curr) {
+        g_sessionBias = BIAS_SELL;
+        Print("M15 BIAS set to SELL (Price < EMA).");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Detect Order Blocks (M5) - FIXED VERSION                  |
+//+------------------------------------------------------------------+
+void DetectOrderBlocks()
+{
+    for(int i = 3; i < InpOB_Lookback; i++) {
+        double impClose = m5_rates[i].close;
+        double impOpen = m5_rates[i].open;
+        double impHigh = m5_rates[i].high;
+        double impLow  = m5_rates[i].low;
+        
+        double prevClose = m5_rates[i+1].close;
+        double prevOpen  = m5_rates[i+1].open;
+        double prevHigh  = m5_rates[i+1].high;
+        double prevLow   = m5_rates[i+1].low;
+        
+        datetime obTime = m5_rates[i+1].time;
+        
+        // FIXED: Only check if EXACT same time exists
+        bool exists = false;
+        for(int k=0; k<InpOB_Lookback; k++) {
+            if(g_ob_list[k].time == obTime && g_ob_list[k].time != 0) {
+                exists = true;
+                break;
+            }
+        }
+        if(exists) continue;
+        
+        // Bullish OB
+        bool strongBullImpulse = (impClose > impOpen) && (impHigh > m5_rates[i+2].high);
+        bool prevBearish = (prevClose < prevOpen);
+        
+        if(strongBullImpulse && prevBearish) {
+            if(AddOB(i+1, prevHigh, prevLow, true)) {
+                if(InpVerboseLogs) Print("BULLISH OB detected at ", TimeToString(obTime));
+            }
+            continue; 
+        }
+        
+        // Bearish OB
+        bool strongBearImpulse = (impClose < impOpen) && (impLow < m5_rates[i+2].low);
+        bool prevBullish = (prevClose > prevOpen);
+        
+        if(strongBearImpulse && prevBullish) {
+            if(AddOB(i+1, prevHigh, prevLow, false)) {
+                if(InpVerboseLogs) Print("BEARISH OB detected at ", TimeToString(obTime));
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Add OB - FIXED VERSION with FIFO                         |
+//+------------------------------------------------------------------+
+bool AddOB(int index, double high, double low, bool isBullish) 
+{
+    // First try to find empty slot
+    for(int k=0; k<InpOB_Lookback; k++) {
+        if(g_ob_list[k].time == 0) {
+            g_ob_list[k].time = m5_rates[index].time;
+            g_ob_list[k].price_high = high;
+            g_ob_list[k].price_low = low;
+            g_ob_list[k].is_bullish = isBullish;
+            g_ob_list[k].is_active = true;
+            g_ob_list[k].bars_since_creation = 0;
+            g_ob_list[k].obj_name = "OB_" + IntegerToString(k);
+            g_ob_count++;
+            return true;
+        }
+    }
+    
+    // FIXED: If array full, replace OLDEST inactive OB
+    int oldestIndex = -1;
+    int maxAge = 0;
+    
+    for(int k=0; k<InpOB_Lookback; k++) {
+        if(!g_ob_list[k].is_active && g_ob_list[k].bars_since_creation > maxAge) {
+            maxAge = g_ob_list[k].bars_since_creation;
+            oldestIndex = k;
+        }
+    }
+    
+    // If found inactive old OB, replace it
+    if(oldestIndex >= 0) {
+        ObjectDelete(0, g_ob_list[oldestIndex].obj_name);
+        
+        g_ob_list[oldestIndex].time = m5_rates[index].time;
+        g_ob_list[oldestIndex].price_high = high;
+        g_ob_list[oldestIndex].price_low = low;
+        g_ob_list[oldestIndex].is_bullish = isBullish;
+        g_ob_list[oldestIndex].is_active = true;
+        g_ob_list[oldestIndex].bars_since_creation = 0;
+        
+        if(InpVerboseLogs) Print("Replaced old OB with new one (FIFO)");
+        return true;
+    }
+    
+    // Array penuh dengan OB aktif semua
+    if(InpVerboseLogs) Print("WARNING: OB array full with active OBs!");
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Validate/Mitigate Order Blocks                              |
+//+------------------------------------------------------------------+
+void ValidateOrderBlocks()
+{
+    for(int i=0; i<InpOB_Lookback; i++) {
+        if(g_ob_list[i].time == 0) continue;
+        if(!g_ob_list[i].is_active) continue;
+        
+        double lastClose = m5_rates[1].close;
+        
+        if(g_ob_list[i].is_bullish) {
+            if(lastClose < g_ob_list[i].price_low) {
+                g_ob_list[i].is_active = false;
+                if(InpVerboseLogs) Print("BULLISH OB mitigated at ", TimeToString(g_ob_list[i].time));
+            }
+        } else {
+            if(lastClose > g_ob_list[i].price_high) {
+                g_ob_list[i].is_active = false;
+                if(InpVerboseLogs) Print("BEARISH OB mitigated at ", TimeToString(g_ob_list[i].time));
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Visualize OBs                                             |
+//+------------------------------------------------------------------+
+void DrawVisuals()
+{
+    if(!InpShowVisuals) return;
+    
+    for(int i=0; i<InpOB_Lookback; i++) {
+        if(g_ob_list[i].time == 0) continue;
+        
+        color clr = (g_ob_list[i].is_bullish) ? clrDodgerBlue : clrCrimson;
+        int width = (g_ob_list[i].is_active) ? 2 : 1;
+        long style = (g_ob_list[i].is_active) ? STYLE_SOLID : STYLE_DOT;
+        
+        double expansionPoints = InpOB_Expansion * _Point;
+        double visHigh = g_ob_list[i].price_high + expansionPoints;
+        double visLow = g_ob_list[i].price_low - expansionPoints;
+        
+        datetime endTime = g_ob_list[i].time + PeriodSeconds(PERIOD_M5) * 20; 
+        
+        if(ObjectFind(0, g_ob_list[i].obj_name) >= 0) {
+            ObjectDelete(0, g_ob_list[i].obj_name);
+        }
+        
+        ObjectCreate(0, g_ob_list[i].obj_name, OBJ_RECTANGLE, 0, g_ob_list[i].time, visHigh, endTime, visLow);
+        ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_COLOR, clr);
+        ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_BACK, true);
+        ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_STYLE, style);
+        ObjectSetInteger(0, g_ob_list[i].obj_name, OBJPROP_WIDTH, width);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Check Entry Signal (TEST MODE: Zone Check Bypassed)       |
+//+------------------------------------------------------------------+
+void CheckEntrySignal_Debug()
+{
+    if(CopyBuffer(h_M5_BB, 1, 0, 2, m5_bb_upper) < 2) return;
+    if(CopyBuffer(h_M5_BB, 2, 0, 2, m5_bb_lower) < 2) return;
+    
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double prevClose = m5_rates[1].close;
+    
+    string debugText = "=== DEBUG V4.3 FIXED ===\n";
+    debugText += "Zone Check: " + (InpCheckZoneEntry ? "ON" : "OFF") + "\n";
+    debugText += "Active OBs: " + IntegerToString(CountActiveOBs()) + "/" + IntegerToString(g_ob_count) + "\n";
+    
+    if(InpRespectSessionBias) {
+        debugText += "Bias: " + EnumToString(g_sessionBias) + "\n";
+        if(g_sessionBias == BIAS_NONE) {
+            debugText += "[WAITING FOR M15 BIAS...]\n";
+            Comment(debugText);
+            return;
+        }
+    } else {
+        debugText += "Bias: DISABLED\n";
+    }
+    
+    debugText += "Trades: " + IntegerToString(g_tradesCountSession) + "/" + IntegerToString(InpMaxTradesPerSession) + "\n";
+    
+    bool foundCandidate = false;
+    string failReason = "";
+    
+    for(int i=0; i<InpOB_Lookback; i++) {
+        if(g_ob_list[i].time == 0) continue;
+        if(!g_ob_list[i].is_active) continue;
+        
+        if(!foundCandidate) {
+            foundCandidate = true;
+            
+            // 1. Bias Check
+            bool biasOk = true;
+            if(InpRespectSessionBias) {
+                if(g_ob_list[i].is_bullish && g_sessionBias != BIAS_BUY) biasOk = false;
+                if(!g_ob_list[i].is_bullish && g_sessionBias != BIAS_SELL) biasOk = false;
+            }
+            
+            debugText += "1. Bias: " + (biasOk ? "PASS" : "FAIL") + "\n";
+            if(!biasOk) { failReason = "Bias Mismatch"; continue; }
+            
+            // 2. Zone Check
+            bool insideZone = true;
+            double expansion = InpOB_Expansion * _Point; // Hitung expansion di sini agar bisa dipakai nanti
+            
+            if(InpCheckZoneEntry) {
+                double zoneHigh = g_ob_list[i].price_high + expansion;
+                double zoneLow  = g_ob_list[i].price_low - expansion;
+                
+                if(g_ob_list[i].is_bullish) {
+                    insideZone = (ask >= zoneLow && ask <= zoneHigh);
+                } else {
+                    insideZone = (bid <= zoneHigh && bid >= zoneLow);
+                }
+                
+                debugText += "2. Zone: " + (insideZone ? "PASS" : "FAIL") + "\n";
+                if(!insideZone) { failReason = "Out of Zone"; continue; }
+            } else {
+                debugText += "2. Zone: BYPASSED (WARNING: SL may vary)\n";
+            }
+            
+            // 3. BB Check
+            bool bbOk = true;
+            if(!InpBypassBBFilter) {
+                if(g_ob_list[i].is_bullish) {
+                    bbOk = (prevClose <= m5_bb_lower[1]);
+                } else {
+                    bbOk = (prevClose >= m5_bb_upper[1]);
+                }
+                debugText += "3. BB: " + (bbOk ? "PASS" : "FAIL") + "\n";
+                if(!bbOk) { failReason = "BB Failed"; continue; }
+            } else {
+                debugText += "3. BB: BYPASSED\n";
+            }
+            
+            // 4. NEW: Min SL Distance Check
+            double sl = 0;
+            double entryPrice = (g_ob_list[i].is_bullish) ? ask : bid;
+            
+            if(g_ob_list[i].is_bullish) {
+                sl = g_ob_list[i].price_low - (InpStopLossBuffer * _Point);
+            } else {
+                sl = g_ob_list[i].price_high + (InpStopLossBuffer * _Point);
+            }
+            
+            double currentSLDist = MathAbs(entryPrice - sl);
+            bool slOk = true;
+            
+            if(currentSLDist < InpMinSLPoints) {
+                slOk = false;
+                failReason = "SL Too Close (" + DoubleToString(currentSLDist/_Point, 0) + " pts)";
+            }
+            
+            debugText += "4. SL Check: " + (slOk ? "PASS" : "FAIL") + " (" + DoubleToString(currentSLDist/_Point,0) + " pts)\n";
+            if(!slOk) continue;
+            
+            // EXECUTE
+            debugText += "\n>>> EXECUTING TRADE! <<<\n";
+            Comment(debugText);
+            
+            double riskDist;
+            
+            if(g_ob_list[i].is_bullish) {
+                // SL sudah dihitung di atas
+                riskDist = g_ob_list[i].price_high - g_ob_list[i].price_low; 
+                
+                if(InpCheckZoneEntry) {
+                     riskDist = (g_ob_list[i].price_high + expansion) - (g_ob_list[i].price_low - expansion);
+                }
+                
+                ExecuteTrade(i, true, ask, sl, riskDist);
+            } else {
+                // SL sudah dihitung di atas
+                riskDist = g_ob_list[i].price_high - g_ob_list[i].price_low;
+                
+                if(InpCheckZoneEntry) {
+                     riskDist = (g_ob_list[i].price_high + expansion) - (g_ob_list[i].price_low - expansion);
+                }
+                ExecuteTrade(i, false, bid, sl, riskDist);
+            }
+            return;
+        }
+    }
+    
+    if(!foundCandidate) {
+        debugText += "No Active OB found.";
+    } else {
+        debugText += "\n[FAIL]: " + failReason;
+    }
+    
+    Comment(debugText);
+}
+
+//+------------------------------------------------------------------+
+//| Execute Trade                                                      |
+//+------------------------------------------------------------------+
+void ExecuteTrade(int obIndex, bool isBuy, double entry, double sl, double riskDist)
+{
+    double tp = (isBuy) ? entry + (riskDist * 2.0) : entry - (riskDist * 2.0);
+    double lots = InpFixedLot;
+    if(lots == 0.0) lots = CalculateLotSize(riskDist);
+    
+    if(isBuy) {
+        if(trade.Buy(lots, _Symbol, entry, sl, tp, "OB_Buy")) {
+            Print("✅ BUY Order Placed | Lot: ", lots, " | SL: ", sl, " | TP: ", tp);
+            g_tradesCountSession++;
+            g_lastTradeTime = TimeCurrent();
+            g_ob_list[obIndex].is_active = false;
+        }
+    } else {
+        if(trade.Sell(lots, _Symbol, entry, sl, tp, "OB_Sell")) {
+            Print("✅ SELL Order Placed | Lot: ", lots, " | SL: ", sl, " | TP: ", tp);
+            g_tradesCountSession++;
+            g_lastTradeTime = TimeCurrent();
+            g_ob_list[obIndex].is_active = false;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Calculate Lot Size                                        |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double slDistance)
+{
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskValue = accountBalance * (InpRiskPercent / 100.0);
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickSize == 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    
+    double points = slDistance / tickSize;
+    if(points == 0) return minLot;
+    
+    double lots = riskValue / (points * tickValue);
+    lots = MathFloor(lots / lotStep) * lotStep;
+    if(lots < minLot) lots = minLot;
+    if(lots > maxLot) lots = maxLot;
+    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Manage Open Trades (COMPLETED)                                    |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(PositionSelectByTicket(PositionGetTicket(i))) {
+            if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum) continue;
+            
+            ulong ticket = PositionGetInteger(POSITION_TICKET);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double sl = PositionGetDouble(POSITION_SL);
+            double tp = PositionGetDouble(POSITION_TP);
+            double currentPrice = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                                  SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                  SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            double riskDist = MathAbs(openPrice - sl);
+            double profitDist = 0;
+            
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+                profitDist = currentPrice - openPrice;
+                
+                // 1. Breakeven Logic (Risk 1:1)
+                if(profitDist >= riskDist && sl < openPrice) {
+                    trade.PositionModify(ticket, openPrice + (10 * _Point), tp);
+                }
+                // 2. Trailing Stop Logic (Risk 1.5)
+                else if(profitDist >= (riskDist * 1.5)) {
+                    double newSL = currentPrice - (riskDist * 0.5);
+                    // Hanya modify jika SL baru lebih tinggi (mengamankan profit)
+                    if(newSL > sl) { 
+                        trade.PositionModify(ticket, newSL, tp);
+                    }
+                }
+            } 
+            else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
+                profitDist = openPrice - currentPrice;
+                
+                // 1. Breakeven Logic
+                if(profitDist >= riskDist && sl > openPrice) {
+                    trade.PositionModify(ticket, openPrice - (10 * _Point), tp);
+                }
+                // 2. Trailing Stop Logic
+                else if(profitDist >= (riskDist * 1.5)) {
+                    double newSL = currentPrice + (riskDist * 0.5);
+                    // Hanya modify jika SL baru lebih rendah (mengamankan profit)
+                    if(newSL < sl) {
+                        trade.PositionModify(ticket, newSL, tp);
+                    }
+                }
+            }
+        }
+    }
+}
+//+------------------------------------------------------------------+
